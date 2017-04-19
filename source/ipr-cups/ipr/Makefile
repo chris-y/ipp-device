@@ -75,7 +75,7 @@ install:	all
 
 ipr:	$(OBJS) ../cups/libcups.a
 	echo Linking $@...
-	$(CXX) $(LDFLAGS) -o $@ $(OBJS) ../cups/libcups.a -lstdc++
+	$(CXX) $(LDFLAGS) -o $@ $(OBJS) ../cups/libcups.a -lssl -lcrypto -lz -lregex -lstdc++
 #	$(CXX) $(LDFLAGS) -o $@ $(OBJS) -lstdc++
 
 #

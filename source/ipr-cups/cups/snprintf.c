@@ -1,64 +1,47 @@
 /*
- * "$Id: snprintf.c,v 1.12 2004/04/11 17:06:22 mike Exp $"
+ * snprintf functions for CUPS.
  *
- *   snprintf functions for the Common UNIX Printing System (CUPS).
+ * Copyright 2007-2013 by Apple Inc.
+ * Copyright 1997-2007 by Easy Software Products.
  *
- *   Copyright 1997-2004 by Easy Software Products.
+ * These coded instructions, statements, and computer programs are the
+ * property of Apple Inc. and are protected by Federal copyright
+ * law.  Distribution and use rights are outlined in the file "LICENSE.txt"
+ * which should have been included with this file.  If this file is
+ * missing or damaged, see the license at "http://www.cups.org/".
  *
- *   These coded instructions, statements, and computer programs are the
- *   property of Easy Software Products and are protected by Federal
- *   copyright law.  Distribution and use rights are outlined in the file
- *   "LICENSE.txt" which should have been included with this file.  If this
- *   file is missing or damaged please contact Easy Software Products
- *   at:
- *
- *       Attn: CUPS Licensing Information
- *       Easy Software Products
- *       44141 Airport View Drive, Suite 204
- *       Hollywood, Maryland 20636-3111 USA
- *
- *       Voice: (301) 373-9603
- *       EMail: cups-info@cups.org
- *         WWW: http://www.cups.org
- *
- *   This file is subject to the Apple OS-Developed Software exception.
- *
- * Contents:
- *
- *   cups_vsnprintf() - Format a string into a fixed size buffer.
- *   cups_snprintf()  - Format a string into a fixed size buffer.
+ * This file is subject to the Apple OS-Developed Software exception.
  */
 
 /*
  * Include necessary headers...
  */
 
-#include <stdio.h>
-#include <ctype.h>
-#include "string.h"
+#include "string-private.h"
 
 
 #ifndef HAVE_VSNPRINTF
 /*
- * 'cups_vsnprintf()' - Format a string into a fixed size buffer.
+ * '_cups_vsnprintf()' - Format a string into a fixed size buffer.
  */
 
 int					/* O - Number of bytes formatted */
-cups_vsnprintf(char       *buffer,	/* O - Output buffer */
-               size_t     bufsize,	/* O - Size of output buffer */
-	       const char *format,	/* I - printf-style format string */
-	       va_list    ap)		/* I - Pointer to additional arguments */
+_cups_vsnprintf(char       *buffer,	/* O - Output buffer */
+                size_t     bufsize,	/* O - Size of output buffer */
+	        const char *format,	/* I - printf-style format string */
+	        va_list    ap)		/* I - Pointer to additional arguments */
 {
   char		*bufptr,		/* Pointer to position in buffer */
 		*bufend,		/* Pointer to end of buffer */
 		sign,			/* Sign of format width */
 		size,			/* Size character (h, l, L) */
 		type;			/* Format type character */
-  const char	*bufformat;		/* Start of format */
   int		width,			/* Width of field */
 		prec;			/* Number of characters of precision */
   char		tformat[100],		/* Temporary format string for sprintf() */
+		*tptr,			/* Pointer into temporary format */
 		temp[1024];		/* Buffer for formatted numbers */
+  size_t	templen;		/* Length of "temp" */
   char		*s;			/* Pointer to string */
   int		slen;			/* Length of string */
   int		bytes;			/* Total number of bytes needed */
@@ -76,30 +59,80 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
   {
     if (*format == '%')
     {
-      bufformat = format;
-      format ++;
+      tptr = tformat;
+      *tptr++ = *format++;
 
       if (*format == '%')
       {
-        *bufptr++ = *format++;
+        if (bufptr && bufptr < bufend) *bufptr++ = *format;
+        bytes ++;
+        format ++;
 	continue;
       }
       else if (strchr(" -+#\'", *format))
+      {
+        *tptr++ = *format;
         sign = *format++;
+      }
       else
         sign = 0;
 
-      width = 0;
-      while (isdigit(*format))
-        width = width * 10 + *format++ - '0';
+      if (*format == '*')
+      {
+       /*
+        * Get width from argument...
+	*/
+
+	format ++;
+	width = va_arg(ap, int);
+
+	snprintf(tptr, sizeof(tformat) - (tptr - tformat), "%d", width);
+	tptr += strlen(tptr);
+      }
+      else
+      {
+	width = 0;
+
+	while (isdigit(*format & 255))
+	{
+	  if (tptr < (tformat + sizeof(tformat) - 1))
+	    *tptr++ = *format;
+
+	  width = width * 10 + *format++ - '0';
+	}
+      }
 
       if (*format == '.')
       {
-        format ++;
-	prec = 0;
+	if (tptr < (tformat + sizeof(tformat) - 1))
+	  *tptr++ = *format;
 
-	while (isdigit(*format))
-          prec = prec * 10 + *format++ - '0';
+        format ++;
+
+        if (*format == '*')
+	{
+         /*
+	  * Get precision from argument...
+	  */
+
+	  format ++;
+	  prec = va_arg(ap, int);
+
+	  snprintf(tptr, sizeof(tformat) - (tptr - tformat), "%d", prec);
+	  tptr += strlen(tptr);
+	}
+	else
+	{
+	  prec = 0;
+
+	  while (isdigit(*format & 255))
+	  {
+	    if (tptr < (tformat + sizeof(tformat) - 1))
+	      *tptr++ = *format;
+
+	    prec = prec * 10 + *format++ - '0';
+	  }
+	}
       }
       else
         prec = -1;
@@ -107,15 +140,31 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
       if (*format == 'l' && format[1] == 'l')
       {
         size = 'L';
+
+	if (tptr < (tformat + sizeof(tformat) - 2))
+	{
+	  *tptr++ = 'l';
+	  *tptr++ = 'l';
+	}
+
 	format += 2;
       }
       else if (*format == 'h' || *format == 'l' || *format == 'L')
+      {
+	if (tptr < (tformat + sizeof(tformat) - 1))
+	  *tptr++ = *format;
+
         size = *format++;
+      }
 
       if (!*format)
         break;
 
-      type = *format++;
+      if (tptr < (tformat + sizeof(tformat) - 1))
+        *tptr++ = *format;
+
+      type  = *format++;
+      *tptr = '\0';
 
       switch (type)
       {
@@ -124,29 +173,25 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
 	case 'e' :
 	case 'f' :
 	case 'g' :
-	    if ((format - bufformat + 1) > sizeof(tformat) ||
-	        (width + 2) > sizeof(temp))
+	    if ((width + 2) > sizeof(temp))
 	      break;
 
-	    strncpy(tformat, bufformat, format - bufformat);
-	    tformat[format - bufformat] = '\0';
-
 	    sprintf(temp, tformat, va_arg(ap, double));
+	    templen = strlen(temp):
 
-            bytes += strlen(temp);
+            bytes += (int)templen;
 
             if (bufptr)
 	    {
-	      if ((bufptr + strlen(temp)) > bufend)
+	      if ((bufptr + templen) > bufend)
 	      {
-		strncpy(bufptr, temp, bufend - bufptr);
+		strlcpy(bufptr, temp, (size_t)(bufend - bufptr));
 		bufptr = bufend;
-		break;
 	      }
 	      else
 	      {
-		strcpy(bufptr, temp);
-		bufptr += strlen(temp);
+		memcpy(bufptr, temp, templen + 1);
+		bufptr += templen;
 	      }
 	    }
 	    break;
@@ -159,57 +204,49 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
 	case 'o' :
 	case 'u' :
 	case 'x' :
-	    if ((format - bufformat + 1) > sizeof(tformat) ||
-	        (width + 2) > sizeof(temp))
+	    if ((width + 2) > sizeof(temp))
 	      break;
 
-	    strncpy(tformat, bufformat, format - bufformat);
-	    tformat[format - bufformat] = '\0';
-
 	    sprintf(temp, tformat, va_arg(ap, int));
+	    templen = strlen(temp):
 
-            bytes += strlen(temp);
+            bytes += (int)templen;
 
 	    if (bufptr)
 	    {
-	      if ((bufptr + strlen(temp)) > bufend)
+	      if ((bufptr + templen) > bufend)
 	      {
-		strncpy(bufptr, temp, bufend - bufptr);
+		strlcpy(bufptr, temp, (size_t)(bufend - bufptr));
 		bufptr = bufend;
-		break;
 	      }
 	      else
 	      {
-		strcpy(bufptr, temp);
-		bufptr += strlen(temp);
+		memcpy(bufptr, temp, templen + 1);
+		bufptr += templen;
 	      }
 	    }
 	    break;
-	    
+
 	case 'p' : /* Pointer value */
-	    if ((format - bufformat + 1) > sizeof(tformat) ||
-	        (width + 2) > sizeof(temp))
+	    if ((width + 2) > sizeof(temp))
 	      break;
 
-	    strncpy(tformat, bufformat, format - bufformat);
-	    tformat[format - bufformat] = '\0';
-
 	    sprintf(temp, tformat, va_arg(ap, void *));
+	    templen = strlen(temp):
 
-            bytes += strlen(temp);
+            bytes += (int)templen;
 
 	    if (bufptr)
 	    {
-	      if ((bufptr + strlen(temp)) > bufend)
+	      if ((bufptr + templen) > bufend)
 	      {
-		strncpy(bufptr, temp, bufend - bufptr);
+		strlcpy(bufptr, temp, (size_t)(bufend - bufptr));
 		bufptr = bufend;
-		break;
 	      }
 	      else
 	      {
-		strcpy(bufptr, temp);
-		bufptr += strlen(temp);
+		memcpy(bufptr, temp, templen + 1);
+		bufptr += templen;
 	      }
 	    }
 	    break;
@@ -220,13 +257,13 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
 	    if (bufptr)
 	    {
 	      if (width <= 1)
-		*bufptr++ = va_arg(ap, int);
+	        *bufptr++ = va_arg(ap, int);
 	      else
 	      {
 		if ((bufptr + width) > bufend)
-	          width = bufend - bufptr;
+		  width = (int)(bufend - bufptr);
 
-		memcpy(bufptr, va_arg(ap, char *), width);
+		memcpy(bufptr, va_arg(ap, char *), (size_t)width);
 		bufptr += width;
 	      }
 	    }
@@ -236,7 +273,7 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
 	    if ((s = va_arg(ap, char *)) == NULL)
 	      s = "(null)";
 
-	    slen = strlen(s);
+	    slen = (int)strlen(s);
 	    if (slen > width && prec != width)
 	      width = slen;
 
@@ -245,20 +282,20 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
 	    if (bufptr)
 	    {
 	      if ((bufptr + width) > bufend)
-		width = bufend - bufptr;
+	        width = (int)(bufend - bufptr);
 
               if (slen > width)
-		slen = width;
+	        slen = width;
 
 	      if (sign == '-')
 	      {
-		strncpy(bufptr, s, slen);
-		memset(bufptr + slen, ' ', width - slen);
+		memcpy(bufptr, s, (size_t)slen);
+		memset(bufptr + slen, ' ', (size_t)(width - slen));
 	      }
 	      else
 	      {
-		memset(bufptr, ' ', width - slen);
-		strncpy(bufptr + width - slen, s, slen);
+		memset(bufptr, ' ', (size_t)(width - slen));
+		memcpy(bufptr + width - slen, s, (size_t)slen);
 	      }
 
 	      bufptr += width;
@@ -266,31 +303,7 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
 	    break;
 
 	case 'n' : /* Output number of chars so far */
-	    if ((format - bufformat + 1) > sizeof(tformat) ||
-	        (width + 2) > sizeof(temp))
-	      break;
-
-	    strncpy(tformat, bufformat, format - bufformat);
-	    tformat[format - bufformat] = '\0';
-
-	    sprintf(temp, tformat, va_arg(ap, int));
-
-            bytes += strlen(temp);
-
-	    if (bufptr)
-	    {
-	      if ((bufptr + strlen(temp)) > bufend)
-	      {
-		strncpy(bufptr, temp, bufend - bufptr);
-		bufptr = bufend;
-		break;
-	      }
-	      else
-	      {
-		strcpy(bufptr, temp);
-		bufptr += strlen(temp);
-	      }
-	    }
+	    *(va_arg(ap, int *)) = bytes;
 	    break;
       }
     }
@@ -299,7 +312,9 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
       bytes ++;
 
       if (bufptr && bufptr < bufend)
-	*bufptr++ = *format++;
+        *bufptr++ = *format;
+
+      format ++;
     }
   }
 
@@ -316,14 +331,14 @@ cups_vsnprintf(char       *buffer,	/* O - Output buffer */
 
 #ifndef HAVE_SNPRINTF
 /*
- * 'cups_snprintf()' - Format a string into a fixed size buffer.
+ * '_cups_snprintf()' - Format a string into a fixed size buffer.
  */
 
 int					/* O - Number of bytes formatted */
-cups_snprintf(char       *buffer,	/* O - Output buffer */
-              size_t     bufsize,	/* O - Size of output buffer */
-              const char *format,	/* I - printf-style format string */
-	      ...)			/* I - Additional arguments as needed */
+_cups_snprintf(char       *buffer,	/* O - Output buffer */
+               size_t     bufsize,	/* O - Size of output buffer */
+               const char *format,	/* I - printf-style format string */
+	       ...)			/* I - Additional arguments as needed */
 {
   int		bytes;			/* Number of bytes formatted */
   va_list 	ap;			/* Pointer to additional arguments */
@@ -336,9 +351,3 @@ cups_snprintf(char       *buffer,	/* O - Output buffer */
   return (bytes);
 }
 #endif /* !HAVE_SNPRINTF */
-
-
-/*
- * End of "$Id: snprintf.c,v 1.12 2004/04/11 17:06:22 mike Exp $".
- */
-

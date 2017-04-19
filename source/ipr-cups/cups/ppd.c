@@ -1,86 +1,38 @@
 /*
- * "$Id: ppd.c,v 1.117 2004/02/25 20:14:51 mike Exp $"
+ * PPD file routines for CUPS.
  *
- *   PPD file routines for the Common UNIX Printing System (CUPS).
+ * Copyright 2007-2017 by Apple Inc.
+ * Copyright 1997-2007 by Easy Software Products, all rights reserved.
  *
- *   Copyright 1997-2004 by Easy Software Products, all rights reserved.
+ * These coded instructions, statements, and computer programs are the
+ * property of Apple Inc. and are protected by Federal copyright
+ * law.  Distribution and use rights are outlined in the file "LICENSE.txt"
+ * which should have been included with this file.  If this file is
+ * missing or damaged, see the license at "http://www.cups.org/".
  *
- *   These coded instructions, statements, and computer programs are the
- *   property of Easy Software Products and are protected by Federal
- *   copyright law.  Distribution and use rights are outlined in the file
- *   "LICENSE.txt" which should have been included with this file.  If this
- *   file is missing or damaged please contact Easy Software Products
- *   at:
+ * PostScript is a trademark of Adobe Systems, Inc.
  *
- *       Attn: CUPS Licensing Information
- *       Easy Software Products
- *       44141 Airport View Drive, Suite 204
- *       Hollywood, Maryland 20636-3111 USA
+ * This code and any derivative of it may be used and distributed
+ * freely under the terms of the GNU General Public License when
+ * used with GNU Ghostscript or its derivatives.  Use of the code
+ * (or any derivative of it) with software other than GNU
+ * GhostScript (or its derivatives) is governed by the CUPS license
+ * agreement.
  *
- *       Voice: (301) 373-9603
- *       EMail: cups-info@cups.org
- *         WWW: http://www.cups.org
- *
- *   PostScript is a trademark of Adobe Systems, Inc.
- *
- *   This code and any derivative of it may be used and distributed
- *   freely under the terms of the GNU General Public License when
- *   used with GNU Ghostscript or its derivatives.  Use of the code
- *   (or any derivative of it) with software other than GNU
- *   GhostScript (or its derivatives) is governed by the CUPS license
- *   agreement.
- *
- *   This file is subject to the Apple OS-Developed Software exception.
- *
- * Contents:
- *
- *   _ppd_attr_compare()   - Compare two attributes.
- *   ppdClose()            - Free all memory used by the PPD file.
- *   ppdErrorString()      - Returns the text assocated with a status.
- *   ppdLastError()        - Return the status from the last ppdOpen*().
- *   ppdOpen()             - Read a PPD file into memory.
- *   ppdOpenFd()           - Read a PPD file into memory.
- *   ppdOpenFile()         - Read a PPD file into memory.
- *   ppdSetConformance()   - Set the conformance level for PPD files.
- *   ppd_add_attr()        - Add an attribute to the PPD data.
- *   ppd_add_choice()      - Add a choice to an option.
- *   ppd_add_size()        - Add a page size.
- *   ppd_compare_groups()  - Compare two groups.
- *   ppd_compare_options() - Compare two options.
- *   ppd_decode()          - Decode a string value...
- *   ppd_fix()             - Fix WinANSI characters in the range 0x80 to
- *                           0x9f to be valid ISO-8859-1 characters...
- *   ppd_free_group()      - Free a single UI group.
- *   ppd_free_option()     - Free a single option.
- *   ppd_get_group()       - Find or create the named group as needed.
- *   ppd_get_option()      - Find or create the named option as needed.
- *   ppd_read()            - Read a line from a PPD file, skipping comment
- *                           lines as necessary.
+ * This file is subject to the Apple OS-Developed Software exception.
  */
 
 /*
  * Include necessary headers.
  */
 
-#include "ppd.h"
-#include <stdlib.h>
-#include <ctype.h>
-#include "string.h"
-#include "language.h"
-#include "debug.h"
+#include "cups-private.h"
+#include "ppd-private.h"
 
 
 /*
  * Definitions...
  */
-
-#if defined(WIN32) || defined(__EMX__)
-#  define READ_BINARY	"rb"		/* Open a binary file for reading */
-#  define WRITE_BINARY	"wb"		/* Open a binary file for writing */
-#else
-#  define READ_BINARY	"r"		/* Open a binary file for reading */
-#  define WRITE_BINARY	"w"		/* Open a binary file for writing */
-#endif /* WIN32 || __EMX__ */
 
 #define ppd_free(p)	if (p) free(p)	/* Safe free macro */
 
@@ -89,16 +41,30 @@
 #define PPD_TEXT	4		/* Line contained human-readable text */
 #define PPD_STRING	8		/* Line contained a string or code */
 
+#define PPD_HASHSIZE	512		/* Size of hash */
+
+
+/*
+ * Line buffer structure...
+ */
+
+typedef struct _ppd_line_s
+{
+  char		*buffer;		/* Pointer to buffer */
+  size_t	bufsize;		/* Size of the buffer */
+} _ppd_line_t;
+
 
 /*
  * Local globals...
  */
 
-static ppd_status_t	ppd_status = PPD_OK;
-					/* Status of last ppdOpen*() */
-static int		ppd_line = 0;	/* Current line number */
-static ppd_conform_t	ppd_conform = PPD_CONFORM_RELAXED;
-					/* Level of conformance required */
+static _cups_threadkey_t ppd_globals_key = _CUPS_THREADKEY_INITIALIZER;
+					/* Thread local storage key */
+#ifdef HAVE_PTHREAD_H
+static pthread_once_t	ppd_globals_key_once = PTHREAD_ONCE_INIT;
+					/* One-time initialization object */
+#endif /* HAVE_PTHREAD_H */
 
 
 /*
@@ -110,43 +76,37 @@ static ppd_attr_t	*ppd_add_attr(ppd_file_t *ppd, const char *name,
 				      const char *value);
 static ppd_choice_t	*ppd_add_choice(ppd_option_t *option, const char *name);
 static ppd_size_t	*ppd_add_size(ppd_file_t *ppd, const char *name);
-#ifndef __APPLE__
-static int		ppd_compare_groups(ppd_group_t *g0, ppd_group_t *g1);
-static int		ppd_compare_options(ppd_option_t *o0, ppd_option_t *o1);
-#endif /* !__APPLE__ */
+static int		ppd_compare_attrs(ppd_attr_t *a, ppd_attr_t *b);
+static int		ppd_compare_choices(ppd_choice_t *a, ppd_choice_t *b);
+static int		ppd_compare_coptions(ppd_coption_t *a,
+			                     ppd_coption_t *b);
+static int		ppd_compare_options(ppd_option_t *a, ppd_option_t *b);
 static int		ppd_decode(char *string);
-#ifndef __APPLE__
-static void		ppd_fix(char *string);
-#else
-#  define		ppd_fix(s)
-#endif /* !__APPLE__ */
+static void		ppd_free_filters(ppd_file_t *ppd);
 static void		ppd_free_group(ppd_group_t *group);
 static void		ppd_free_option(ppd_option_t *option);
+static ppd_coption_t	*ppd_get_coption(ppd_file_t *ppd, const char *name);
+static ppd_cparam_t	*ppd_get_cparam(ppd_coption_t *opt,
+			                const char *param,
+					const char *text);
 static ppd_group_t	*ppd_get_group(ppd_file_t *ppd, const char *name,
-			               const char *text);
+			               const char *text, _ppd_globals_t *pg,
+				       cups_encoding_t encoding);
 static ppd_option_t	*ppd_get_option(ppd_group_t *group, const char *name);
-static int		ppd_read(FILE *fp, char *keyword, char *option,
-			         char *text, char **string, int ignoreblank);
-
-
-/*
- * '_ppd_attr_compare()' - Compare two attributes.
- */
-
-int					/* O - Result of comparison */
-_ppd_attr_compare(ppd_attr_t **a,	/* I - First attribute */
-                  ppd_attr_t **b)	/* I - Second attribute */
-{
-  int	ret;				/* Result of comparison */
-
-
-  if ((ret = strcasecmp((*a)->name, (*b)->name)) != 0)
-    return (ret);
-  else if ((*a)->spec[0] && (*b)->spec[0])
-    return (strcasecmp((*a)->spec, (*b)->spec));
-  else
-    return (0);
-}
+static _ppd_globals_t	*ppd_globals_alloc(void);
+#if defined(HAVE_PTHREAD_H) || defined(WIN32)
+static void		ppd_globals_free(_ppd_globals_t *g);
+#endif /* HAVE_PTHREAD_H || WIN32 */
+#ifdef HAVE_PTHREAD_H
+static void		ppd_globals_init(void);
+#endif /* HAVE_PTHREAD_H */
+static int		ppd_hash_option(ppd_option_t *option);
+static int		ppd_read(cups_file_t *fp, _ppd_line_t *line,
+			         char *keyword, char *option, char *text,
+				 char **string, int ignoreblank,
+				 _ppd_globals_t *pg);
+static int		ppd_update_filters(ppd_file_t *ppd,
+			                   _ppd_globals_t *pg);
 
 
 /*
@@ -156,29 +116,33 @@ _ppd_attr_compare(ppd_attr_t **a,	/* I - First attribute */
 void
 ppdClose(ppd_file_t *ppd)		/* I - PPD file record */
 {
-  int		i;			/* Looping var */
-  ppd_emul_t	*emul;			/* Current emulation */
-  ppd_group_t	*group;			/* Current group */
-  char		**font;			/* Current font */
-  char		**filter;		/* Current filter */
-  ppd_attr_t	**attr;			/* Current attribute */
+  int			i;		/* Looping var */
+  ppd_emul_t		*emul;		/* Current emulation */
+  ppd_group_t		*group;		/* Current group */
+  char			**font;		/* Current font */
+  ppd_attr_t		**attr;		/* Current attribute */
+  ppd_coption_t		*coption;	/* Current custom option */
+  ppd_cparam_t		*cparam;	/* Current custom parameter */
 
 
  /*
-  * Range check the PPD file record...
+  * Range check arguments...
   */
 
-  if (ppd == NULL)
+  if (!ppd)
     return;
 
  /*
   * Free all strings at the top level...
   */
 
-  ppd_free(ppd->patches);
-  ppd_free(ppd->jcl_begin);
-  ppd_free(ppd->jcl_end);
-  ppd_free(ppd->jcl_ps);
+  _cupsStrFree(ppd->lang_encoding);
+  _cupsStrFree(ppd->nickname);
+  if (ppd->patches)
+    free(ppd->patches);
+  _cupsStrFree(ppd->jcl_begin);
+  _cupsStrFree(ppd->jcl_end);
+  _cupsStrFree(ppd->jcl_ps);
 
  /*
   * Free any emulations...
@@ -188,8 +152,8 @@ ppdClose(ppd_file_t *ppd)		/* I - PPD file record */
   {
     for (i = ppd->num_emulations, emul = ppd->emulations; i > 0; i --, emul ++)
     {
-      ppd_free(emul->start);
-      ppd_free(emul->stop);
+      _cupsStrFree(emul->start);
+      _cupsStrFree(emul->stop);
     }
 
     ppd_free(ppd->emulations);
@@ -207,37 +171,28 @@ ppdClose(ppd_file_t *ppd)		/* I - PPD file record */
     ppd_free(ppd->groups);
   }
 
+  cupsArrayDelete(ppd->options);
+  cupsArrayDelete(ppd->marked);
+
  /*
   * Free any page sizes...
   */
 
   if (ppd->num_sizes > 0)
-  {
     ppd_free(ppd->sizes);
-  }
 
  /*
   * Free any constraints...
   */
 
   if (ppd->num_consts > 0)
-  {
     ppd_free(ppd->consts);
-  }
 
  /*
   * Free any filters...
   */
 
-  if (ppd->num_filters > 0)
-  {
-    for (i = ppd->num_filters, filter = ppd->filters; i > 0; i --, filter ++)
-    {
-      ppd_free(*filter);
-    }
-
-    ppd_free(ppd->filters);
-  }
+  ppd_free_filters(ppd);
 
  /*
   * Free any fonts...
@@ -246,9 +201,7 @@ ppdClose(ppd_file_t *ppd)		/* I - PPD file record */
   if (ppd->num_fonts > 0)
   {
     for (i = ppd->num_fonts, font = ppd->fonts; i > 0; i --, font ++)
-    {
-      ppd_free(*font);
-    }
+      _cupsStrFree(*font);
 
     ppd_free(ppd->fonts);
   }
@@ -258,9 +211,7 @@ ppdClose(ppd_file_t *ppd)		/* I - PPD file record */
   */
 
   if (ppd->num_profiles > 0)
-  {
     ppd_free(ppd->profiles);
-  }
 
  /*
   * Free any attributes...
@@ -270,12 +221,75 @@ ppdClose(ppd_file_t *ppd)		/* I - PPD file record */
   {
     for (i = ppd->num_attrs, attr = ppd->attrs; i > 0; i --, attr ++)
     {
-      ppd_free((*attr)->value);
+      _cupsStrFree((*attr)->value);
       ppd_free(*attr);
     }
 
     ppd_free(ppd->attrs);
   }
+
+  cupsArrayDelete(ppd->sorted_attrs);
+
+ /*
+  * Free custom options...
+  */
+
+  for (coption = (ppd_coption_t *)cupsArrayFirst(ppd->coptions);
+       coption;
+       coption = (ppd_coption_t *)cupsArrayNext(ppd->coptions))
+  {
+    for (cparam = (ppd_cparam_t *)cupsArrayFirst(coption->params);
+         cparam;
+	 cparam = (ppd_cparam_t *)cupsArrayNext(coption->params))
+    {
+      switch (cparam->type)
+      {
+        case PPD_CUSTOM_PASSCODE :
+        case PPD_CUSTOM_PASSWORD :
+        case PPD_CUSTOM_STRING :
+            _cupsStrFree(cparam->current.custom_string);
+	    break;
+
+	default :
+	    break;
+      }
+
+      free(cparam);
+    }
+
+    cupsArrayDelete(coption->params);
+
+    free(coption);
+  }
+
+  cupsArrayDelete(ppd->coptions);
+
+ /*
+  * Free constraints...
+  */
+
+  if (ppd->cups_uiconstraints)
+  {
+    _ppd_cups_uiconsts_t *consts;	/* Current constraints */
+
+
+    for (consts = (_ppd_cups_uiconsts_t *)cupsArrayFirst(ppd->cups_uiconstraints);
+         consts;
+	 consts = (_ppd_cups_uiconsts_t *)cupsArrayNext(ppd->cups_uiconstraints))
+    {
+      free(consts->constraints);
+      free(consts);
+    }
+
+    cupsArrayDelete(ppd->cups_uiconstraints);
+  }
+
+ /*
+  * Free any PPD cache/mapping data...
+  */
+
+  if (ppd->cache)
+    _ppdCacheDestroy(ppd->cache);
 
  /*
   * Free the whole record...
@@ -286,7 +300,9 @@ ppdClose(ppd_file_t *ppd)		/* I - PPD file record */
 
 
 /*
- * 'ppdErrorString()' - Returns the text assocated with a status.
+ * 'ppdErrorString()' - Returns the text associated with a status.
+ *
+ * @since CUPS 1.1.19/macOS 10.3@
  */
 
 const char *				/* O - Status string */
@@ -294,60 +310,139 @@ ppdErrorString(ppd_status_t status)	/* I - PPD status */
 {
   static const char * const messages[] =/* Status messages */
 		{
-		  "OK",
-		  "Unable to open PPD file",
-		  "NULL PPD file pointer",
-		  "Memory allocation error",
-		  "Missing PPD-Adobe-4.x header",
-		  "Missing value string",
-		  "Internal error",
-		  "Bad OpenGroup",
-		  "OpenGroup without a CloseGroup first",
-		  "Bad OpenUI/JCLOpenUI",
-		  "OpenUI/JCLOpenUI without a CloseUI/JCLCloseUI first",
-		  "Bad OrderDependency",
-		  "Bad UIConstraints",
-		  "Missing asterisk in column 1",
-		  "Line longer than the maximum allowed (255 characters)",
-		  "Illegal control character",
-		  "Illegal main keyword string",
-		  "Illegal option keyword string",
-		  "Illegal translation string",
-		  "Illegal whitespace character"
+		  _("OK"),
+		  _("Unable to open PPD file"),
+		  _("NULL PPD file pointer"),
+		  _("Memory allocation error"),
+		  _("Missing PPD-Adobe-4.x header"),
+		  _("Missing value string"),
+		  _("Internal error"),
+		  _("Bad OpenGroup"),
+		  _("OpenGroup without a CloseGroup first"),
+		  _("Bad OpenUI/JCLOpenUI"),
+		  _("OpenUI/JCLOpenUI without a CloseUI/JCLCloseUI first"),
+		  _("Bad OrderDependency"),
+		  _("Bad UIConstraints"),
+		  _("Missing asterisk in column 1"),
+		  _("Line longer than the maximum allowed (255 characters)"),
+		  _("Illegal control character"),
+		  _("Illegal main keyword string"),
+		  _("Illegal option keyword string"),
+		  _("Illegal translation string"),
+		  _("Illegal whitespace character"),
+		  _("Bad custom parameter"),
+		  _("Missing option keyword"),
+		  _("Bad value string"),
+		  _("Missing CloseGroup")
 		};
 
 
-  if (status < PPD_OK || status > PPD_ILLEGAL_WHITESPACE)
-    return ("Unknown");
+  if (status < PPD_OK || status >= PPD_MAX_STATUS)
+    return (_cupsLangString(cupsLangDefault(), _("Unknown")));
   else
-    return (messages[status]);
+    return (_cupsLangString(cupsLangDefault(), messages[status]));
+}
+
+
+/*
+ * '_ppdGetEncoding()' - Get the CUPS encoding value for the given
+ *                       LanguageEncoding.
+ */
+
+cups_encoding_t				/* O - CUPS encoding value */
+_ppdGetEncoding(const char *name)	/* I - LanguageEncoding string */
+{
+  if (!_cups_strcasecmp(name, "ISOLatin1"))
+    return (CUPS_ISO8859_1);
+  else if (!_cups_strcasecmp(name, "ISOLatin2"))
+    return (CUPS_ISO8859_2);
+  else if (!_cups_strcasecmp(name, "ISOLatin5"))
+    return (CUPS_ISO8859_5);
+  else if (!_cups_strcasecmp(name, "JIS83-RKSJ"))
+    return (CUPS_JIS_X0213);
+  else if (!_cups_strcasecmp(name, "MacStandard"))
+    return (CUPS_MAC_ROMAN);
+  else if (!_cups_strcasecmp(name, "WindowsANSI"))
+    return (CUPS_WINDOWS_1252);
+  else
+    return (CUPS_UTF8);
+}
+
+
+/*
+ * '_ppdGlobals()' - Return a pointer to thread local storage
+ */
+
+_ppd_globals_t *			/* O - Pointer to global data */
+_ppdGlobals(void)
+{
+  _ppd_globals_t *pg;			/* Pointer to global data */
+
+
+#ifdef HAVE_PTHREAD_H
+ /*
+  * Initialize the global data exactly once...
+  */
+
+  pthread_once(&ppd_globals_key_once, ppd_globals_init);
+#endif /* HAVE_PTHREAD_H */
+
+ /*
+  * See if we have allocated the data yet...
+  */
+
+  if ((pg = (_ppd_globals_t *)_cupsThreadGetData(ppd_globals_key)) == NULL)
+  {
+   /*
+    * No, allocate memory as set the pointer for the key...
+    */
+
+    if ((pg = ppd_globals_alloc()) != NULL)
+      _cupsThreadSetData(ppd_globals_key, pg);
+  }
+
+ /*
+  * Return the pointer to the data...
+  */
+
+  return (pg);
 }
 
 
 /*
  * 'ppdLastError()' - Return the status from the last ppdOpen*().
+ *
+ * @since CUPS 1.1.19/macOS 10.3@
  */
 
 ppd_status_t				/* O - Status code */
 ppdLastError(int *line)			/* O - Line number */
 {
-  if (line)
-    *line = ppd_line;
+  _ppd_globals_t	*pg = _ppdGlobals();
+					/* Global data */
 
-  return (ppd_status);
+
+  if (line)
+    *line = pg->ppd_line;
+
+  return (pg->ppd_status);
 }
 
 
 /*
- * 'ppdOpen()' - Read a PPD file into memory.
+ * '_ppdOpen()' - Read a PPD file into memory.
+ *
+ * @since CUPS 1.2/macOS 10.5@
  */
 
-ppd_file_t *				/* O - PPD file record */
-ppdOpen(FILE *fp)			/* I - File to read from */
+ppd_file_t *				/* O - PPD file record or @code NULL@ if the PPD file could not be opened. */
+_ppdOpen(
+    cups_file_t		*fp,		/* I - File to read from */
+    _ppd_localization_t	localization)	/* I - Localization to load */
 {
-  char			*oldlocale;	/* Old locale settings */
-  int			i, j, k, m;	/* Looping vars */
+  int			i, j, k;	/* Looping vars */
   int			count;		/* Temporary count */
+  _ppd_line_t		line;		/* Line buffer */
   ppd_file_t		*ppd;		/* PPD file record */
   ppd_group_t		*group,		/* Current group */
 			*subgroup;	/* Current sub-group */
@@ -371,10 +466,31 @@ ppdOpen(FILE *fp)			/* I - File to read from */
   ppd_section_t		section;	/* Order dependency section */
   ppd_profile_t		*profile;	/* Pointer to color profile */
   char			**filter;	/* Pointer to filter */
-  cups_lang_t		*language;	/* Default language */
+  struct lconv		*loc;		/* Locale data */
   int			ui_keyword;	/* Is this line a UI keyword? */
+  cups_lang_t		*lang;		/* Language data */
+  cups_encoding_t	encoding;	/* Encoding of PPD file */
+  _ppd_globals_t	*pg = _ppdGlobals();
+					/* Global data */
+  char			custom_name[PPD_MAX_NAME];
+					/* CustomFoo attribute name */
+  ppd_attr_t		*custom_attr;	/* CustomFoo attribute */
+  char			ll[7],		/* Base language + '.' */
+			ll_CC[7];	/* Language w/country + '.' */
+  size_t		ll_len = 0,	/* Base language length */
+			ll_CC_len = 0;	/* Language w/country length */
   static const char * const ui_keywords[] =
 			{
+#ifdef CUPS_USE_FULL_UI_KEYWORDS_LIST
+ /*
+  * Adobe defines some 41 keywords as "UI", meaning that they are
+  * user interface elements and that they should be treated as such
+  * even if the PPD creator doesn't use Open/CloseUI around them.
+  *
+  * Since this can cause previously invisible options to appear and
+  * confuse users, the default is to only treat the PageSize and
+  * PageRegion keywords this way.
+  */
 			  /* Boolean keywords */
 			  "BlackSubstitution",
 			  "Booklet",
@@ -419,15 +535,26 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 			  "StapleWhen",
 			  "StapleX",
 			  "StapleY"
+#else /* !CUPS_USE_FULL_UI_KEYWORDS_LIST */
+			  "PageRegion",
+			  "PageSize"
+#endif /* CUPS_USE_FULL_UI_KEYWORDS_LIST */
+			};
+  static const char * const color_keywords[] =	/* Keywords associated with color profiles */
+			{
+			  ".cupsICCProfile",
+			  ".ColorModel",
 			};
 
+
+  DEBUG_printf(("_ppdOpen(fp=%p)", fp));
 
  /*
   * Default to "OK" status...
   */
 
-  ppd_status = PPD_OK;
-  ppd_line   = 0;
+  pg->ppd_status = PPD_OK;
+  pg->ppd_line   = 0;
 
  /*
   * Range check input...
@@ -435,37 +562,86 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 
   if (fp == NULL)
   {
-    ppd_status = PPD_NULL_FILE;
+    pg->ppd_status = PPD_NULL_FILE;
     return (NULL);
+  }
+
+ /*
+  * If only loading a single localization set up the strings to match...
+  */
+
+  if (localization == _PPD_LOCALIZATION_DEFAULT)
+  {
+    if ((lang = cupsLangDefault()) == NULL)
+      return (NULL);
+
+    snprintf(ll_CC, sizeof(ll_CC), "%s.", lang->language);
+
+   /*
+    * <rdar://problem/22130168>
+    * <rdar://problem/27245567>
+    *
+    * Need to use a different base language for some locales...
+    */
+
+    if (!strcmp(lang->language, "zh_HK"))
+    {					/* Traditional Chinese + variants */
+      strlcpy(ll_CC, "zh_TW.", sizeof(ll_CC));
+      strlcpy(ll, "zh_", sizeof(ll));
+    }
+    else if (!strncmp(lang->language, "zh", 2))
+      strlcpy(ll, "zh_", sizeof(ll));	/* Any Chinese variant */
+    else if (!strncmp(lang->language, "jp", 2))
+    {					/* Any Japanese variant */
+      strlcpy(ll_CC, "ja", sizeof(ll_CC));
+      strlcpy(ll, "jp", sizeof(ll));
+    }
+    else if (!strncmp(lang->language, "nb", 2) || !strncmp(lang->language, "no", 2))
+    {					/* Any Norwegian variant */
+      strlcpy(ll_CC, "nb", sizeof(ll_CC));
+      strlcpy(ll, "no", sizeof(ll));
+    }
+    else
+      snprintf(ll, sizeof(ll), "%2.2s.", lang->language);
+
+    ll_CC_len = strlen(ll_CC);
+    ll_len    = strlen(ll);
+
+    DEBUG_printf(("2_ppdOpen: Loading localizations matching \"%s\" and \"%s\"",
+                  ll_CC, ll));
   }
 
  /*
   * Grab the first line and make sure it reads '*PPD-Adobe: "major.minor"'...
   */
 
-  mask = ppd_read(fp, keyword, name, text, &string, 0);
+  line.buffer  = NULL;
+  line.bufsize = 0;
 
-  DEBUG_printf(("mask=%x, keyword=\"%s\"...\n", mask, keyword));
+  mask = ppd_read(fp, &line, keyword, name, text, &string, 0, pg);
+
+  DEBUG_printf(("2_ppdOpen: mask=%x, keyword=\"%s\"...", mask, keyword));
 
   if (mask == 0 ||
-      strcmp(keyword, "PPD-Adobe") != 0 ||
+      strcmp(keyword, "PPD-Adobe") ||
       string == NULL || string[0] != '4')
   {
    /*
     * Either this is not a PPD file, or it is not a 4.x PPD file.
     */
 
-    if (ppd_status == PPD_OK)
-      ppd_status = PPD_MISSING_PPDADOBE4;
+    if (pg->ppd_status == PPD_OK)
+      pg->ppd_status = PPD_MISSING_PPDADOBE4;
 
-    ppd_free(string);
+    _cupsStrFree(string);
+    ppd_free(line.buffer);
 
     return (NULL);
   }
 
-  DEBUG_printf(("ppdOpen: keyword = %s, string = %p\n", keyword, string));
+  DEBUG_printf(("2_ppdOpen: keyword=%s, string=%p", keyword, string));
 
-  ppd_free(string);
+  _cupsStrFree(string);
 
  /*
   * Allocate memory for the PPD file record...
@@ -473,27 +649,20 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 
   if ((ppd = calloc(1, sizeof(ppd_file_t))) == NULL)
   {
-    ppd_status = PPD_ALLOC_ERROR;
+    pg->ppd_status = PPD_ALLOC_ERROR;
+
+    _cupsStrFree(string);
+    ppd_free(line.buffer);
 
     return (NULL);
   }
 
-  ppd->language_level = 1;
+  ppd->language_level = 2;
   ppd->color_device   = 0;
-  ppd->colorspace     = PPD_CS_GRAY;
+  ppd->colorspace     = PPD_CS_N;
   ppd->landscape      = -90;
-
- /*
-  * Get the default language for the user...
-  */
-
-  language = cupsLangDefault();
-
-#ifdef LC_NUMERIC
-  oldlocale = _cupsSaveLocale(LC_NUMERIC, "C");
-#else
-  oldlocale = _cupsSaveLocale(LC_ALL, "C");
-#endif /* LC_NUMERIC */
+  ppd->coptions       = cupsArrayNew((cups_array_func_t)ppd_compare_coptions,
+                                     NULL);
 
  /*
   * Read lines from the PPD file and add them to the file record...
@@ -504,43 +673,28 @@ ppdOpen(FILE *fp)			/* I - File to read from */
   option     = NULL;
   choice     = NULL;
   ui_keyword = 0;
+  encoding   = CUPS_ISO8859_1;
+  loc        = localeconv();
 
-  while ((mask = ppd_read(fp, keyword, name, text, &string, 1)) != 0)
+  while ((mask = ppd_read(fp, &line, keyword, name, text, &string, 1, pg)) != 0)
   {
-#ifdef DEBUG
-    printf("mask = %x, keyword = \"%s\"", mask, keyword);
+    DEBUG_printf(("2_ppdOpen: mask=%x, keyword=\"%s\", name=\"%s\", "
+                  "text=\"%s\", string=%d chars...", mask, keyword, name, text,
+		  string ? (int)strlen(string) : 0));
 
-    if (name[0] != '\0')
-      printf(", name = \"%s\"", name);
-
-    if (text[0] != '\0')
-      printf(", text = \"%s\"", text);
-
-    if (string != NULL)
-    {
-      if (strlen(string) > 40)
-        printf(", string = %p", string);
-      else
-        printf(", string = \"%s\"", string);
-    }
-
-    puts("");
-#endif /* DEBUG */
-
-    if (strcmp(keyword, "CloseUI") && strcmp(keyword, "CloseGroup") &&
-	strcmp(keyword, "CloseSubGroup") && strncmp(keyword, "Default", 7) &&
-        strcmp(keyword, "JCLCloseUI") && strcmp(keyword, "JCLOpenUI") &&
-	strcmp(keyword, "OpenUI") && strcmp(keyword, "OpenGroup") &&
-	strcmp(keyword, "OpenSubGroup") && string == NULL)
+    if (strncmp(keyword, "Default", 7) && !string &&
+        pg->ppd_conform != PPD_CONFORM_RELAXED)
     {
      /*
       * Need a string value!
       */
 
-      ppd_status = PPD_MISSING_VALUE;
+      pg->ppd_status = PPD_MISSING_VALUE;
 
       goto error;
     }
+    else if (!string)
+      continue;
 
    /*
     * Certain main keywords (as defined by the PPD spec) may be used
@@ -561,6 +715,50 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       ui_keyword = 0;
     }
 
+   /*
+    * If we are filtering out keyword localizations, see if this line needs to
+    * be used...
+    */
+
+    if (localization != _PPD_LOCALIZATION_ALL &&
+        (temp = strchr(keyword, '.')) != NULL &&
+        ((temp - keyword) == 2 || (temp - keyword) == 5) &&
+        _cups_isalpha(keyword[0]) &&
+        _cups_isalpha(keyword[1]) &&
+        (keyword[2] == '.' ||
+         (keyword[2] == '_' && _cups_isalpha(keyword[3]) &&
+          _cups_isalpha(keyword[4]) && keyword[5] == '.')))
+    {
+      if (localization == _PPD_LOCALIZATION_NONE ||
+	  (localization == _PPD_LOCALIZATION_DEFAULT &&
+	   strncmp(ll_CC, keyword, ll_CC_len) &&
+	   strncmp(ll, keyword, ll_len)))
+      {
+	DEBUG_printf(("2_ppdOpen: Ignoring localization: \"%s\"\n", keyword));
+	continue;
+      }
+      else if (localization == _PPD_LOCALIZATION_ICC_PROFILES)
+      {
+       /*
+        * Only load localizations for the color profile related keywords...
+        */
+
+	for (i = 0;
+	     i < (int)(sizeof(color_keywords) / sizeof(color_keywords[0]));
+	     i ++)
+	{
+	  if (!_cups_strcasecmp(temp, color_keywords[i]))
+	    break;
+	}
+
+	if (i >= (int)(sizeof(color_keywords) / sizeof(color_keywords[0])))
+	{
+	  DEBUG_printf(("2_ppdOpen: Ignoring localization: \"%s\"\n", keyword));
+	  continue;
+	}
+      }
+    }
+
     if (option == NULL &&
         (mask & (PPD_KEYWORD | PPD_OPTION | PPD_STRING)) ==
 	    (PPD_KEYWORD | PPD_OPTION | PPD_STRING))
@@ -577,27 +775,16 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 
         ui_keyword = 1;
 
-        DEBUG_printf(("**** FOUND ADOBE UI KEYWORD %s WITHOUT OPENUI!\n",
+        DEBUG_printf(("2_ppdOpen: FOUND ADOBE UI KEYWORD %s WITHOUT OPENUI!",
 	              keyword));
 
         if (!group)
 	{
-          if (strcmp(keyword, "Collate") && strcmp(keyword, "Duplex") &&
-              strcmp(keyword, "InputSlot") && strcmp(keyword, "ManualFeed") &&
-              strcmp(keyword, "MediaType") && strcmp(keyword, "MediaColor") &&
-              strcmp(keyword, "MediaWeight") && strcmp(keyword, "OutputBin") &&
-              strcmp(keyword, "OutputMode") && strcmp(keyword, "OutputOrder") &&
-	      strcmp(keyword, "PageSize") && strcmp(keyword, "PageRegion"))
-	    group = ppd_get_group(ppd, "Extra",
-	                          cupsLangString(language, CUPS_MSG_EXTRA));
-	  else
-	    group = ppd_get_group(ppd, "General",
-	                          cupsLangString(language, CUPS_MSG_GENERAL));
-
-          if (group == NULL)
+          if ((group = ppd_get_group(ppd, "General", _("General"), pg,
+	                             encoding)) == NULL)
 	    goto error;
 
-          DEBUG_printf(("Adding to group %s...\n", group->text));
+          DEBUG_printf(("2_ppdOpen: Adding to group %s...", group->text));
           option = ppd_get_option(group, keyword);
 	  group  = NULL;
 	}
@@ -606,7 +793,7 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 
 	if (option == NULL)
 	{
-          ppd_status = PPD_ALLOC_ERROR;
+          pg->ppd_status = PPD_ALLOC_ERROR;
 
           goto error;
 	}
@@ -632,89 +819,108 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 	      !strcmp(ppd->attrs[j]->name + 7, keyword) &&
 	      ppd->attrs[j]->value)
 	  {
-	    DEBUG_printf(("Setting Default%s to %s via attribute...\n",
+	    DEBUG_printf(("2_ppdOpen: Setting Default%s to %s via attribute...",
 	                  option->keyword, ppd->attrs[j]->value));
 	    strlcpy(option->defchoice, ppd->attrs[j]->value,
 	            sizeof(option->defchoice));
 	    break;
 	  }
 
-        if (strcmp(keyword, "PageSize") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_MEDIA_SIZE),
-                  sizeof(option->text));
-	else if (strcmp(keyword, "MediaType") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_MEDIA_TYPE),
-                  sizeof(option->text));
-	else if (strcmp(keyword, "InputSlot") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_MEDIA_SOURCE),
-                  sizeof(option->text));
-	else if (strcmp(keyword, "ColorModel") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_OUTPUT_MODE),
-                  sizeof(option->text));
-	else if (strcmp(keyword, "Resolution") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_RESOLUTION),
-                  sizeof(option->text));
+        if (!strcmp(keyword, "PageSize"))
+	  strlcpy(option->text, _("Media Size"), sizeof(option->text));
+	else if (!strcmp(keyword, "MediaType"))
+	  strlcpy(option->text, _("Media Type"), sizeof(option->text));
+	else if (!strcmp(keyword, "InputSlot"))
+	  strlcpy(option->text, _("Media Source"), sizeof(option->text));
+	else if (!strcmp(keyword, "ColorModel"))
+	  strlcpy(option->text, _("Output Mode"), sizeof(option->text));
+	else if (!strcmp(keyword, "Resolution"))
+	  strlcpy(option->text, _("Resolution"), sizeof(option->text));
         else
 	  strlcpy(option->text, keyword, sizeof(option->text));
       }
     }
 
-    if (strcmp(keyword, "LanguageLevel") == 0)
+    if (!strcmp(keyword, "LanguageLevel"))
       ppd->language_level = atoi(string);
-    else if (strcmp(keyword, "LanguageEncoding") == 0)
-      ppd->lang_encoding = string;
-    else if (strcmp(keyword, "LanguageVersion") == 0)
-      ppd->lang_version = string;
-    else if (strcmp(keyword, "Manufacturer") == 0)
-      ppd->manufacturer = string;
-    else if (strcmp(keyword, "ModelName") == 0)
-      ppd->modelname = string;
-    else if (strcmp(keyword, "Protocols") == 0)
-      ppd->protocols = string;
-    else if (strcmp(keyword, "PCFileName") == 0)
-      ppd->pcfilename = string;
-    else if (strcmp(keyword, "NickName") == 0)
-      ppd->nickname = string;
-    else if (strcmp(keyword, "Product") == 0)
-      ppd->product = string;
-    else if (strcmp(keyword, "ShortNickName") == 0)
-      ppd->shortnickname = string;
-    else if (strcmp(keyword, "TTRasterizer") == 0)
-      ppd->ttrasterizer = string;
-    else if (strcmp(keyword, "JCLBegin") == 0)
+    else if (!strcmp(keyword, "LanguageEncoding"))
     {
-      ppd->jcl_begin = strdup(string);
+     /*
+      * Say all PPD files are UTF-8, since we convert to UTF-8...
+      */
+
+      ppd->lang_encoding = _cupsStrAlloc("UTF-8");
+      encoding           = _ppdGetEncoding(string);
+    }
+    else if (!strcmp(keyword, "LanguageVersion"))
+      ppd->lang_version = string;
+    else if (!strcmp(keyword, "Manufacturer"))
+      ppd->manufacturer = string;
+    else if (!strcmp(keyword, "ModelName"))
+      ppd->modelname = string;
+    else if (!strcmp(keyword, "Protocols"))
+      ppd->protocols = string;
+    else if (!strcmp(keyword, "PCFileName"))
+      ppd->pcfilename = string;
+    else if (!strcmp(keyword, "NickName"))
+    {
+      if (encoding != CUPS_UTF8)
+      {
+        cups_utf8_t	utf8[256];	/* UTF-8 version of NickName */
+
+
+        cupsCharsetToUTF8(utf8, string, sizeof(utf8), encoding);
+	ppd->nickname = _cupsStrAlloc((char *)utf8);
+      }
+      else
+        ppd->nickname = _cupsStrAlloc(string);
+    }
+    else if (!strcmp(keyword, "Product"))
+      ppd->product = string;
+    else if (!strcmp(keyword, "ShortNickName"))
+      ppd->shortnickname = string;
+    else if (!strcmp(keyword, "TTRasterizer"))
+      ppd->ttrasterizer = string;
+    else if (!strcmp(keyword, "JCLBegin"))
+    {
+      ppd->jcl_begin = _cupsStrAlloc(string);
       ppd_decode(ppd->jcl_begin);	/* Decode quoted string */
     }
-    else if (strcmp(keyword, "JCLEnd") == 0)
+    else if (!strcmp(keyword, "JCLEnd"))
     {
-      ppd->jcl_end = strdup(string);
+      ppd->jcl_end = _cupsStrAlloc(string);
       ppd_decode(ppd->jcl_end);		/* Decode quoted string */
     }
-    else if (strcmp(keyword, "JCLToPSInterpreter") == 0)
+    else if (!strcmp(keyword, "JCLToPSInterpreter"))
     {
-      ppd->jcl_ps = strdup(string);
+      ppd->jcl_ps = _cupsStrAlloc(string);
       ppd_decode(ppd->jcl_ps);		/* Decode quoted string */
     }
-    else if (strcmp(keyword, "AccurateScreensSupport") == 0)
-      ppd->accurate_screens = strcmp(string, "True") == 0;
-    else if (strcmp(keyword, "ColorDevice") == 0)
-      ppd->color_device = strcmp(string, "True") == 0;
-    else if (strcmp(keyword, "ContoneOnly") == 0)
-      ppd->contone_only = strcmp(string, "True") == 0;
-    else if (strcmp(keyword, "cupsFlipDuplex") == 0)
-      ppd->flip_duplex = strcmp(string, "True") == 0;
-    else if (strcmp(keyword, "cupsManualCopies") == 0)
-      ppd->manual_copies = strcmp(string, "True") == 0;
-    else if (strcmp(keyword, "cupsModelNumber") == 0)
+    else if (!strcmp(keyword, "AccurateScreensSupport"))
+      ppd->accurate_screens = !strcmp(string, "True");
+    else if (!strcmp(keyword, "ColorDevice"))
+      ppd->color_device = !strcmp(string, "True");
+    else if (!strcmp(keyword, "ContoneOnly"))
+      ppd->contone_only = !strcmp(string, "True");
+    else if (!strcmp(keyword, "cupsFlipDuplex"))
+      ppd->flip_duplex = !strcmp(string, "True");
+    else if (!strcmp(keyword, "cupsManualCopies"))
+      ppd->manual_copies = !strcmp(string, "True");
+    else if (!strcmp(keyword, "cupsModelNumber"))
       ppd->model_number = atoi(string);
-    else if (strcmp(keyword, "cupsColorProfile") == 0)
+    else if (!strcmp(keyword, "cupsColorProfile"))
     {
       if (ppd->num_profiles == 0)
         profile = malloc(sizeof(ppd_profile_t));
       else
-        profile = realloc(ppd->profiles, sizeof(ppd_profile_t) *
-	                                 (ppd->num_profiles + 1));
+        profile = realloc(ppd->profiles, sizeof(ppd_profile_t) * (size_t)(ppd->num_profiles + 1));
+
+      if (!profile)
+      {
+        pg->ppd_status = PPD_ALLOC_ERROR;
+
+	goto error;
+      }
 
       ppd->profiles     = profile;
       profile           += ppd->num_profiles;
@@ -723,26 +929,29 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       memset(profile, 0, sizeof(ppd_profile_t));
       strlcpy(profile->resolution, name, sizeof(profile->resolution));
       strlcpy(profile->media_type, text, sizeof(profile->media_type));
-      sscanf(string, "%f%f%f%f%f%f%f%f%f%f%f", &(profile->density),
-	     &(profile->gamma),
-	     profile->matrix[0] + 0, profile->matrix[0] + 1,
-	     profile->matrix[0] + 2, profile->matrix[1] + 0,
-	     profile->matrix[1] + 1, profile->matrix[1] + 2,
-	     profile->matrix[2] + 0, profile->matrix[2] + 1,
-	     profile->matrix[2] + 2);
+
+      profile->density      = (float)_cupsStrScand(string, &sptr, loc);
+      profile->gamma        = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[0][0] = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[0][1] = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[0][2] = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[1][0] = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[1][1] = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[1][2] = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[2][0] = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[2][1] = (float)_cupsStrScand(sptr, &sptr, loc);
+      profile->matrix[2][2] = (float)_cupsStrScand(sptr, &sptr, loc);
     }
-    else if (strcmp(keyword, "cupsFilter") == 0)
+    else if (!strcmp(keyword, "cupsFilter"))
     {
       if (ppd->num_filters == 0)
         filter = malloc(sizeof(char *));
       else
-        filter = realloc(ppd->filters, sizeof(char *) * (ppd->num_filters + 1));
+        filter = realloc(ppd->filters, sizeof(char *) * (size_t)(ppd->num_filters + 1));
 
       if (filter == NULL)
       {
-        ppd_free(filter);
-
-        ppd_status = PPD_ALLOC_ERROR;
+        pg->ppd_status = PPD_ALLOC_ERROR;
 
 	goto error;
       }
@@ -752,15 +961,14 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       ppd->num_filters ++;
 
      /*
-      * Copy filter string and prevent it from being freed below...
+      * Retain a copy of the filter string...
       */
 
-      *filter = string;
-      string  = NULL;
+      *filter = _cupsStrRetain(string);
     }
-    else if (strcmp(keyword, "Throughput") == 0)
+    else if (!strcmp(keyword, "Throughput"))
       ppd->throughput = atoi(string);
-    else if (strcmp(keyword, "Font") == 0)
+    else if (!strcmp(keyword, "Font"))
     {
      /*
       * Add this font to the list of available fonts...
@@ -769,122 +977,231 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       if (ppd->num_fonts == 0)
         tempfonts = (char **)malloc(sizeof(char *));
       else
-        tempfonts = (char **)realloc(ppd->fonts,
-	                             sizeof(char *) * (ppd->num_fonts + 1));
+        tempfonts = (char **)realloc(ppd->fonts, sizeof(char *) * (size_t)(ppd->num_fonts + 1));
 
       if (tempfonts == NULL)
       {
-        ppd_status = PPD_ALLOC_ERROR;
+        pg->ppd_status = PPD_ALLOC_ERROR;
 
 	goto error;
       }
-      
+
       ppd->fonts                 = tempfonts;
-      ppd->fonts[ppd->num_fonts] = strdup(name);
+      ppd->fonts[ppd->num_fonts] = _cupsStrAlloc(name);
       ppd->num_fonts ++;
     }
-    else if (strcmp(keyword, "ParamCustomPageSize") == 0)
+    else if (!strncmp(keyword, "ParamCustom", 11))
     {
-      if (strcmp(name, "Width") == 0)
-        sscanf(string, "%*s%*s%f%f", ppd->custom_min + 0,
-	       ppd->custom_max + 0);
-      else if (strcmp(name, "Height") == 0)
-        sscanf(string, "%*s%*s%f%f", ppd->custom_min + 1,
-	       ppd->custom_max + 1);
-    }
-    else if (strcmp(keyword, "HWMargins") == 0)
-      sscanf(string, "%f%f%f%f", ppd->custom_margins + 0,
-             ppd->custom_margins + 1, ppd->custom_margins + 2,
-             ppd->custom_margins + 3);
-    else if (strcmp(keyword, "CustomPageSize") == 0 &&
-             strcmp(name, "True") == 0)
-    {
-      DEBUG_puts("Processing CustomPageSize...");
+      ppd_coption_t	*coption;	/* Custom option */
+      ppd_cparam_t	*cparam;	/* Custom parameter */
+      int		corder;		/* Order number */
+      char		ctype[33],	/* Data type */
+			cminimum[65],	/* Minimum value */
+			cmaximum[65];	/* Maximum value */
 
-      if (!ppd->variable_sizes)
+
+     /*
+      * Get the custom option and parameter...
+      */
+
+      if ((coption = ppd_get_coption(ppd, keyword + 11)) == NULL)
       {
-	ppd->variable_sizes = 1;
+        pg->ppd_status = PPD_ALLOC_ERROR;
 
+	goto error;
+      }
+
+      if ((cparam = ppd_get_cparam(coption, name, text)) == NULL)
+      {
+        pg->ppd_status = PPD_ALLOC_ERROR;
+
+	goto error;
+      }
+
+     /*
+      * Get the parameter data...
+      */
+
+      if (!string ||
+          sscanf(string, "%d%32s%64s%64s", &corder, ctype, cminimum,
+                 cmaximum) != 4)
+      {
+        pg->ppd_status = PPD_BAD_CUSTOM_PARAM;
+
+	goto error;
+      }
+
+      cparam->order = corder;
+
+      if (!strcmp(ctype, "curve"))
+      {
+        cparam->type = PPD_CUSTOM_CURVE;
+	cparam->minimum.custom_curve = (float)_cupsStrScand(cminimum, NULL, loc);
+	cparam->maximum.custom_curve = (float)_cupsStrScand(cmaximum, NULL, loc);
+      }
+      else if (!strcmp(ctype, "int"))
+      {
+        cparam->type = PPD_CUSTOM_INT;
+	cparam->minimum.custom_int = atoi(cminimum);
+	cparam->maximum.custom_int = atoi(cmaximum);
+      }
+      else if (!strcmp(ctype, "invcurve"))
+      {
+        cparam->type = PPD_CUSTOM_INVCURVE;
+	cparam->minimum.custom_invcurve = (float)_cupsStrScand(cminimum, NULL, loc);
+	cparam->maximum.custom_invcurve = (float)_cupsStrScand(cmaximum, NULL, loc);
+      }
+      else if (!strcmp(ctype, "passcode"))
+      {
+        cparam->type = PPD_CUSTOM_PASSCODE;
+	cparam->minimum.custom_passcode = atoi(cminimum);
+	cparam->maximum.custom_passcode = atoi(cmaximum);
+      }
+      else if (!strcmp(ctype, "password"))
+      {
+        cparam->type = PPD_CUSTOM_PASSWORD;
+	cparam->minimum.custom_password = atoi(cminimum);
+	cparam->maximum.custom_password = atoi(cmaximum);
+      }
+      else if (!strcmp(ctype, "points"))
+      {
+        cparam->type = PPD_CUSTOM_POINTS;
+	cparam->minimum.custom_points = (float)_cupsStrScand(cminimum, NULL, loc);
+	cparam->maximum.custom_points = (float)_cupsStrScand(cmaximum, NULL, loc);
+      }
+      else if (!strcmp(ctype, "real"))
+      {
+        cparam->type = PPD_CUSTOM_REAL;
+	cparam->minimum.custom_real = (float)_cupsStrScand(cminimum, NULL, loc);
+	cparam->maximum.custom_real = (float)_cupsStrScand(cmaximum, NULL, loc);
+      }
+      else if (!strcmp(ctype, "string"))
+      {
+        cparam->type = PPD_CUSTOM_STRING;
+	cparam->minimum.custom_string = atoi(cminimum);
+	cparam->maximum.custom_string = atoi(cmaximum);
+      }
+      else
+      {
+        pg->ppd_status = PPD_BAD_CUSTOM_PARAM;
+
+	goto error;
+      }
+
+     /*
+      * Now special-case for CustomPageSize...
+      */
+
+      if (!strcmp(coption->keyword, "PageSize"))
+      {
+	if (!strcmp(name, "Width"))
+	{
+	  ppd->custom_min[0] = cparam->minimum.custom_points;
+	  ppd->custom_max[0] = cparam->maximum.custom_points;
+	}
+	else if (!strcmp(name, "Height"))
+	{
+	  ppd->custom_min[1] = cparam->minimum.custom_points;
+	  ppd->custom_max[1] = cparam->maximum.custom_points;
+	}
+      }
+    }
+    else if (!strcmp(keyword, "HWMargins"))
+    {
+      for (i = 0, sptr = string; i < 4; i ++)
+        ppd->custom_margins[i] = (float)_cupsStrScand(sptr, &sptr, loc);
+    }
+    else if (!strncmp(keyword, "Custom", 6) && !strcmp(name, "True") && !option)
+    {
+      ppd_option_t	*custom_option;	/* Custom option */
+
+      DEBUG_puts("2_ppdOpen: Processing Custom option...");
+
+     /*
+      * Get the option and custom option...
+      */
+
+      if (!ppd_get_coption(ppd, keyword + 6))
+      {
+        pg->ppd_status = PPD_ALLOC_ERROR;
+
+	goto error;
+      }
+
+      if (option && !_cups_strcasecmp(option->keyword, keyword + 6))
+        custom_option = option;
+      else
+        custom_option = ppdFindOption(ppd, keyword + 6);
+
+      if (custom_option)
+      {
+       /*
+	* Add the "custom" option...
+	*/
+
+        if ((choice = ppdFindChoice(custom_option, "Custom")) == NULL)
+	  if ((choice = ppd_add_choice(custom_option, "Custom")) == NULL)
+	  {
+	    DEBUG_puts("1_ppdOpen: Unable to add Custom choice!");
+
+	    pg->ppd_status = PPD_ALLOC_ERROR;
+
+	    goto error;
+	  }
+
+	strlcpy(choice->text, text[0] ? text : _("Custom"),
+		sizeof(choice->text));
+
+	choice->code = _cupsStrAlloc(string);
+
+	if (custom_option->section == PPD_ORDER_JCL)
+	  ppd_decode(choice->code);
+      }
+
+     /*
+      * Now process custom page sizes specially...
+      */
+
+      if (!strcmp(keyword, "CustomPageSize"))
+      {
        /*
 	* Add a "Custom" page size entry...
 	*/
 
+	ppd->variable_sizes = 1;
+
 	ppd_add_size(ppd, "Custom");
 
-       /*
-	* Add a "Custom" page size option...
-	*/
+	if (option && !_cups_strcasecmp(option->keyword, "PageRegion"))
+	  custom_option = option;
+	else
+	  custom_option = ppdFindOption(ppd, "PageRegion");
 
-        if ((option = ppdFindOption(ppd, "PageSize")) == NULL)
+        if (custom_option)
 	{
-	  ppd_group_t	*temp;
+	  if ((choice = ppdFindChoice(custom_option, "Custom")) == NULL)
+	    if ((choice = ppd_add_choice(custom_option, "Custom")) == NULL)
+	    {
+	      DEBUG_puts("1_ppdOpen: Unable to add Custom choice!");
 
+	      pg->ppd_status = PPD_ALLOC_ERROR;
 
-          DEBUG_puts("PageSize option not found for CustomPageSize...");
+	      goto error;
+	    }
 
-	  if ((temp = ppd_get_group(ppd, "General",
-                                    cupsLangString(language,
-                                                   CUPS_MSG_GENERAL))) == NULL)
-	  {
-	    DEBUG_puts("Unable to get general group!");
-
-	    goto error;
-	  }
-
-	  if ((option = ppd_get_option(temp, "PageSize")) == NULL)
-	  {
-	    DEBUG_puts("Unable to get PageSize option!");
-
-            ppd_status = PPD_ALLOC_ERROR;
-
-	    goto error;
-	  }
+	  strlcpy(choice->text, text[0] ? text : _("Custom"),
+		  sizeof(choice->text));
         }
-
-	if ((choice = ppd_add_choice(option, "Custom")) == NULL)
-	{
-	  DEBUG_puts("Unable to add Custom choice!");
-
-          ppd_status = PPD_ALLOC_ERROR;
-
-	  goto error;
-	}
-
-	strlcpy(choice->text, cupsLangString(language, CUPS_MSG_VARIABLE),
-        	sizeof(choice->text));
-	option = NULL;
       }
-
-      if ((option = ppdFindOption(ppd, "PageSize")) == NULL)
-      {
-	DEBUG_puts("Unable to find PageSize option!");
-
-        ppd_status = PPD_INTERNAL_ERROR;
-
-	goto error;
-      }
-
-      if ((choice = ppdFindChoice(option, "Custom")) == NULL)
-      {
-	DEBUG_puts("Unable to find Custom choice!");
-
-        ppd_status = PPD_INTERNAL_ERROR;
-
-	goto error;
-      }
-
-      choice->code = string;
-      option       = NULL;
-      string       = NULL;		/* Don't add as an attribute below */
     }
-    else if (strcmp(keyword, "LandscapeOrientation") == 0)
+    else if (!strcmp(keyword, "LandscapeOrientation"))
     {
-      if (strcmp(string, "Minus90") == 0)
+      if (!strcmp(string, "Minus90"))
         ppd->landscape = -90;
-      else if (strcmp(string, "Plus90") == 0)
+      else if (!strcmp(string, "Plus90"))
         ppd->landscape = 90;
     }
-    else if (strcmp(keyword, "Emulators") == 0)
+    else if (!strcmp(keyword, "Emulators") && string)
     {
       for (count = 1, sptr = string; sptr != NULL;)
         if ((sptr = strchr(sptr, ' ')) != NULL)
@@ -895,7 +1212,12 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 	}
 
       ppd->num_emulations = count;
-      ppd->emulations     = calloc(count, sizeof(ppd_emul_t));
+      if ((ppd->emulations = calloc((size_t)count, sizeof(ppd_emul_t))) == NULL)
+      {
+        pg->ppd_status = PPD_ALLOC_ERROR;
+
+	goto error;
+      }
 
       for (i = 0, sptr = string; i < count; i ++)
       {
@@ -911,30 +1233,61 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 	  sptr ++;
       }
     }
-    else if (strncmp(keyword, "StartEmulator_", 14) == 0)
+    else if (!strncmp(keyword, "StartEmulator_", 14))
     {
       ppd_decode(string);
 
       for (i = 0; i < ppd->num_emulations; i ++)
-        if (strcmp(keyword + 14, ppd->emulations[i].name) == 0)
+        if (!strcmp(keyword + 14, ppd->emulations[i].name))
 	{
 	  ppd->emulations[i].start = string;
 	  string = NULL;
 	}
     }
-    else if (strncmp(keyword, "StopEmulator_", 13) == 0)
+    else if (!strncmp(keyword, "StopEmulator_", 13))
     {
       ppd_decode(string);
 
       for (i = 0; i < ppd->num_emulations; i ++)
-        if (strcmp(keyword + 13, ppd->emulations[i].name) == 0)
+        if (!strcmp(keyword + 13, ppd->emulations[i].name))
 	{
 	  ppd->emulations[i].stop = string;
 	  string = NULL;
 	}
     }
-    else if (strcmp(keyword, "JobPatchFile") == 0)
+    else if (!strcmp(keyword, "JobPatchFile"))
     {
+     /*
+      * CUPS STR #3421: Check for "*JobPatchFile: int: string"
+      */
+
+      if (isdigit(*string & 255))
+      {
+        for (sptr = string + 1; isdigit(*sptr & 255); sptr ++);
+
+        if (*sptr == ':')
+        {
+         /*
+          * Found "*JobPatchFile: int: string"...
+          */
+
+          pg->ppd_status = PPD_BAD_VALUE;
+
+	  goto error;
+        }
+      }
+
+      if (!name[0] && pg->ppd_conform == PPD_CONFORM_STRICT)
+      {
+       /*
+        * Found "*JobPatchFile: string"...
+        */
+
+        pg->ppd_status = PPD_MISSING_OPTION_KEYWORD;
+
+	goto error;
+      }
+
       if (ppd->patches == NULL)
         ppd->patches = strdup(string);
       else
@@ -943,25 +1296,25 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 	                             strlen(string) + 1);
         if (temp == NULL)
 	{
-          ppd_status = PPD_ALLOC_ERROR;
+          pg->ppd_status = PPD_ALLOC_ERROR;
 
 	  goto error;
 	}
 
         ppd->patches = temp;
 
-        strcpy(ppd->patches + strlen(ppd->patches), string);
+        memcpy(ppd->patches + strlen(ppd->patches), string, strlen(string) + 1);
       }
     }
-    else if (strcmp(keyword, "OpenUI") == 0)
+    else if (!strcmp(keyword, "OpenUI"))
     {
      /*
       * Don't allow nesting of options...
       */
 
-      if (option && ppd_conform == PPD_CONFORM_STRICT)
+      if (option && pg->ppd_conform == PPD_CONFORM_STRICT)
       {
-        ppd_status = PPD_NESTED_OPEN_UI;
+        pg->ppd_status = PPD_NESTED_OPEN_UI;
 
 	goto error;
       }
@@ -970,35 +1323,26 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       * Add an option record to the current sub-group, group, or file...
       */
 
-      if (name[0] == '*')
-        cups_strcpy(name, name + 1); /* Eliminate leading asterisk */
+      DEBUG_printf(("2_ppdOpen: name=\"%s\" (%d)", name, (int)strlen(name)));
 
-      for (i = strlen(name) - 1; i > 0 && isspace(name[i] & 255); i --)
+      if (name[0] == '*')
+        _cups_strcpy(name, name + 1); /* Eliminate leading asterisk */
+
+      for (i = (int)strlen(name) - 1; i > 0 && _cups_isspace(name[i]); i --)
         name[i] = '\0'; /* Eliminate trailing spaces */
 
-      DEBUG_printf(("OpenUI of %s in group %s...\n", name,
+      DEBUG_printf(("2_ppdOpen: OpenUI of %s in group %s...", name,
                     group ? group->text : "(null)"));
 
       if (subgroup != NULL)
         option = ppd_get_option(subgroup, name);
       else if (group == NULL)
       {
-        if (strcmp(name, "Collate") && strcmp(name, "Duplex") &&
-            strcmp(name, "InputSlot") && strcmp(name, "ManualFeed") &&
-            strcmp(name, "MediaType") && strcmp(name, "MediaColor") &&
-            strcmp(name, "MediaWeight") && strcmp(name, "OutputBin") &&
-            strcmp(name, "OutputMode") && strcmp(name, "OutputOrder") &&
-	    strcmp(name, "PageSize") && strcmp(name, "PageRegion"))
-	  group = ppd_get_group(ppd, "Extra",
-	                        cupsLangString(language, CUPS_MSG_EXTRA));
-	else
-	  group = ppd_get_group(ppd, "General",
-	                        cupsLangString(language, CUPS_MSG_GENERAL));
-
-        if (group == NULL)
+	if ((group = ppd_get_group(ppd, "General", _("General"), pg,
+	                           encoding)) == NULL)
 	  goto error;
 
-        DEBUG_printf(("Adding to group %s...\n", group->text));
+        DEBUG_printf(("2_ppdOpen: Adding to group %s...", group->text));
         option = ppd_get_option(group, name);
 	group  = NULL;
       }
@@ -1007,7 +1351,7 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 
       if (option == NULL)
       {
-        ppd_status = PPD_ALLOC_ERROR;
+        pg->ppd_status = PPD_ALLOC_ERROR;
 
 	goto error;
       }
@@ -1016,15 +1360,15 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       * Now fill in the initial information for the option...
       */
 
-      if (string && strcmp(string, "PickMany") == 0)
+      if (string && !strcmp(string, "PickMany"))
         option->ui = PPD_UI_PICKMANY;
-      else if (string && strcmp(string, "Boolean") == 0)
+      else if (string && !strcmp(string, "Boolean"))
         option->ui = PPD_UI_BOOLEAN;
-      else if (string && strcmp(string, "PickOne") == 0)
+      else if (string && !strcmp(string, "PickOne"))
         option->ui = PPD_UI_PICKONE;
-      else if (ppd_conform == PPD_CONFORM_STRICT)
+      else if (pg->ppd_conform == PPD_CONFORM_STRICT)
       {
-        ppd_status = PPD_BAD_OPEN_UI;
+        pg->ppd_status = PPD_BAD_OPEN_UI;
 
 	goto error;
       }
@@ -1036,7 +1380,7 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 	    !strcmp(ppd->attrs[j]->name + 7, name) &&
 	    ppd->attrs[j]->value)
 	{
-	  DEBUG_printf(("Setting Default%s to %s via attribute...\n",
+	  DEBUG_printf(("2_ppdOpen: Setting Default%s to %s via attribute...",
 	                option->keyword, ppd->attrs[j]->value));
 	  strlcpy(option->defchoice, ppd->attrs[j]->value,
 	          sizeof(option->defchoice));
@@ -1044,45 +1388,66 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 	}
 
       if (text[0])
-      {
-        strlcpy(option->text, text, sizeof(option->text));
-	ppd_fix(option->text);
-      }
+        cupsCharsetToUTF8((cups_utf8_t *)option->text, text,
+	                   sizeof(option->text), encoding);
       else
       {
-        if (strcmp(name, "PageSize") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_MEDIA_SIZE),
-                  sizeof(option->text));
-	else if (strcmp(name, "MediaType") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_MEDIA_TYPE),
-                  sizeof(option->text));
-	else if (strcmp(name, "InputSlot") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_MEDIA_SOURCE),
-                  sizeof(option->text));
-	else if (strcmp(name, "ColorModel") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_OUTPUT_MODE),
-                  sizeof(option->text));
-	else if (strcmp(name, "Resolution") == 0)
-	  strlcpy(option->text, cupsLangString(language, CUPS_MSG_RESOLUTION),
-                  sizeof(option->text));
+        if (!strcmp(name, "PageSize"))
+	  strlcpy(option->text, _("Media Size"), sizeof(option->text));
+	else if (!strcmp(name, "MediaType"))
+	  strlcpy(option->text, _("Media Type"), sizeof(option->text));
+	else if (!strcmp(name, "InputSlot"))
+	  strlcpy(option->text, _("Media Source"), sizeof(option->text));
+	else if (!strcmp(name, "ColorModel"))
+	  strlcpy(option->text, _("Output Mode"), sizeof(option->text));
+	else if (!strcmp(name, "Resolution"))
+	  strlcpy(option->text, _("Resolution"), sizeof(option->text));
         else
 	  strlcpy(option->text, name, sizeof(option->text));
       }
 
       option->section = PPD_ORDER_ANY;
 
-      ppd_free(string);
+      _cupsStrFree(string);
       string = NULL;
+
+     /*
+      * Add a custom option choice if we have already seen a CustomFoo
+      * attribute...
+      */
+
+      if (!_cups_strcasecmp(name, "PageRegion"))
+        strlcpy(custom_name, "CustomPageSize", sizeof(custom_name));
+      else
+        snprintf(custom_name, sizeof(custom_name), "Custom%s", name);
+
+      if ((custom_attr = ppdFindAttr(ppd, custom_name, "True")) != NULL)
+      {
+        if ((choice = ppdFindChoice(option, "Custom")) == NULL)
+	  if ((choice = ppd_add_choice(option, "Custom")) == NULL)
+	  {
+	    DEBUG_puts("1_ppdOpen: Unable to add Custom choice!");
+
+	    pg->ppd_status = PPD_ALLOC_ERROR;
+
+	    goto error;
+	  }
+
+	strlcpy(choice->text,
+	        custom_attr->text[0] ? custom_attr->text : _("Custom"),
+		sizeof(choice->text));
+        choice->code = _cupsStrRetain(custom_attr->value);
+      }
     }
-    else if (strcmp(keyword, "JCLOpenUI") == 0)
+    else if (!strcmp(keyword, "JCLOpenUI"))
     {
      /*
       * Don't allow nesting of options...
       */
 
-      if (option && ppd_conform == PPD_CONFORM_STRICT)
+      if (option && pg->ppd_conform == PPD_CONFORM_STRICT)
       {
-        ppd_status = PPD_NESTED_OPEN_UI;
+        pg->ppd_status = PPD_NESTED_OPEN_UI;
 
 	goto error;
       }
@@ -1091,7 +1456,7 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       * Find the JCL group, and add if needed...
       */
 
-      group = ppd_get_group(ppd, "JCL", "JCL");
+      group = ppd_get_group(ppd, "JCL", _("JCL"), pg, encoding);
 
       if (group == NULL)
 	goto error;
@@ -1101,13 +1466,13 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       */
 
       if (name[0] == '*')
-        cups_strcpy(name, name + 1);
+        _cups_strcpy(name, name + 1);
 
       option = ppd_get_option(group, name);
 
       if (option == NULL)
       {
-        ppd_status = PPD_ALLOC_ERROR;
+        pg->ppd_status = PPD_ALLOC_ERROR;
 
 	goto error;
       }
@@ -1116,15 +1481,15 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       * Now fill in the initial information for the option...
       */
 
-      if (string && strcmp(string, "PickMany") == 0)
+      if (string && !strcmp(string, "PickMany"))
         option->ui = PPD_UI_PICKMANY;
-      else if (string && strcmp(string, "Boolean") == 0)
+      else if (string && !strcmp(string, "Boolean"))
         option->ui = PPD_UI_BOOLEAN;
-      else if (string && strcmp(string, "PickOne") == 0)
+      else if (string && !strcmp(string, "PickOne"))
         option->ui = PPD_UI_PICKONE;
       else
       {
-        ppd_status = PPD_BAD_OPEN_UI;
+        pg->ppd_status = PPD_BAD_OPEN_UI;
 
 	goto error;
       }
@@ -1134,30 +1499,57 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 	    !strcmp(ppd->attrs[j]->name + 7, name) &&
 	    ppd->attrs[j]->value)
 	{
-	  DEBUG_printf(("Setting Default%s to %s via attribute...\n",
+	  DEBUG_printf(("2_ppdOpen: Setting Default%s to %s via attribute...",
 	                option->keyword, ppd->attrs[j]->value));
 	  strlcpy(option->defchoice, ppd->attrs[j]->value,
 	          sizeof(option->defchoice));
 	  break;
 	}
 
-      strlcpy(option->text, text, sizeof(option->text));
+      if (text[0])
+        cupsCharsetToUTF8((cups_utf8_t *)option->text, text,
+	                   sizeof(option->text), encoding);
+      else
+        strlcpy(option->text, name, sizeof(option->text));
 
       option->section = PPD_ORDER_JCL;
       group = NULL;
 
-      ppd_free(string);
+      _cupsStrFree(string);
       string = NULL;
+
+     /*
+      * Add a custom option choice if we have already seen a CustomFoo
+      * attribute...
+      */
+
+      snprintf(custom_name, sizeof(custom_name), "Custom%s", name);
+
+      if ((custom_attr = ppdFindAttr(ppd, custom_name, "True")) != NULL)
+      {
+	if ((choice = ppd_add_choice(option, "Custom")) == NULL)
+	{
+	  DEBUG_puts("1_ppdOpen: Unable to add Custom choice!");
+
+	  pg->ppd_status = PPD_ALLOC_ERROR;
+
+	  goto error;
+	}
+
+	strlcpy(choice->text,
+	        custom_attr->text[0] ? custom_attr->text : _("Custom"),
+		sizeof(choice->text));
+        choice->code = _cupsStrRetain(custom_attr->value);
+      }
     }
-    else if (strcmp(keyword, "CloseUI") == 0 ||
-             strcmp(keyword, "JCLCloseUI") == 0)
+    else if (!strcmp(keyword, "CloseUI") || !strcmp(keyword, "JCLCloseUI"))
     {
       option = NULL;
 
-      ppd_free(string);
+      _cupsStrFree(string);
       string = NULL;
     }
-    else if (strcmp(keyword, "OpenGroup") == 0)
+    else if (!strcmp(keyword, "OpenGroup"))
     {
      /*
       * Open a new group...
@@ -1165,14 +1557,14 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 
       if (group != NULL)
       {
-        ppd_status = PPD_NESTED_OPEN_GROUP;
+        pg->ppd_status = PPD_NESTED_OPEN_GROUP;
 
 	goto error;
       }
 
       if (!string)
       {
-        ppd_status = PPD_BAD_OPEN_GROUP;
+        pg->ppd_status = PPD_BAD_OPEN_GROUP;
 
 	goto error;
       }
@@ -1191,72 +1583,72 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       */
 
       ppd_decode(sptr);
-      ppd_fix(sptr);
 
      /*
       * Find/add the group...
       */
 
-      group = ppd_get_group(ppd, string, sptr);
+      group = ppd_get_group(ppd, string, sptr, pg, encoding);
 
       if (group == NULL)
 	goto error;
 
-      ppd_free(string);
+      _cupsStrFree(string);
       string = NULL;
     }
-    else if (strcmp(keyword, "CloseGroup") == 0)
+    else if (!strcmp(keyword, "CloseGroup"))
     {
       group = NULL;
 
-      ppd_free(string);
+      _cupsStrFree(string);
       string = NULL;
     }
-    else if (strcmp(keyword, "OrderDependency") == 0 ||
-             strcmp(keyword, "NonUIOrderDependency") == 0)
+    else if (!strcmp(keyword, "OrderDependency"))
     {
-      if (sscanf(string, "%f%40s%40s", &order, name, keyword) != 3)
+      order = (float)_cupsStrScand(string, &sptr, loc);
+
+      if (!sptr || sscanf(sptr, "%40s%40s", name, keyword) != 2)
       {
-        ppd_status = PPD_BAD_ORDER_DEPENDENCY;
+        pg->ppd_status = PPD_BAD_ORDER_DEPENDENCY;
 
 	goto error;
       }
 
       if (keyword[0] == '*')
-        cups_strcpy(keyword, keyword + 1);
+        _cups_strcpy(keyword, keyword + 1);
 
-      if (strcmp(name, "ExitServer") == 0)
+      if (!strcmp(name, "ExitServer"))
         section = PPD_ORDER_EXIT;
-      else if (strcmp(name, "Prolog") == 0)
+      else if (!strcmp(name, "Prolog"))
         section = PPD_ORDER_PROLOG;
-      else if (strcmp(name, "DocumentSetup") == 0)
+      else if (!strcmp(name, "DocumentSetup"))
         section = PPD_ORDER_DOCUMENT;
-      else if (strcmp(name, "PageSetup") == 0)
+      else if (!strcmp(name, "PageSetup"))
         section = PPD_ORDER_PAGE;
-      else if (strcmp(name, "JCLSetup") == 0)
+      else if (!strcmp(name, "JCLSetup"))
         section = PPD_ORDER_JCL;
       else
         section = PPD_ORDER_ANY;
 
       if (option == NULL)
       {
-        ppd_group_t	*temp;
+        ppd_group_t	*gtemp;
 
 
        /*
         * Only valid for Non-UI options...
 	*/
 
-        for (i = ppd->num_groups, temp = ppd->groups; i > 0; i --, temp ++)
-          if (temp->text[0] == '\0')
+        for (i = ppd->num_groups, gtemp = ppd->groups; i > 0; i --, gtemp ++)
+          if (gtemp->text[0] == '\0')
 	    break;
 
         if (i > 0)
-          for (i = 0; i < temp->num_options; i ++)
-	    if (strcmp(keyword, temp->options[i].keyword) == 0)
+          for (i = 0; i < gtemp->num_options; i ++)
+	    if (!strcmp(keyword, gtemp->options[i].keyword))
 	    {
-	      temp->options[i].section = section;
-	      temp->options[i].order   = order;
+	      gtemp->options[i].section = section;
+	      gtemp->options[i].order   = order;
 	      break;
 	    }
       }
@@ -1266,10 +1658,10 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 	option->order   = order;
       }
 
-      ppd_free(string);
+      _cupsStrFree(string);
       string = NULL;
     }
-    else if (strncmp(keyword, "Default", 7) == 0)
+    else if (!strncmp(keyword, "Default", 7))
     {
       if (string == NULL)
         continue;
@@ -1285,36 +1677,36 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       * Assign the default value as appropriate...
       */
 
-      if (strcmp(keyword, "DefaultColorSpace") == 0)
+      if (!strcmp(keyword, "DefaultColorSpace"))
       {
        /*
         * Set default colorspace...
 	*/
 
-	if (strcmp(string, "CMY") == 0)
+	if (!strcmp(string, "CMY"))
           ppd->colorspace = PPD_CS_CMY;
-	else if (strcmp(string, "CMYK") == 0)
+	else if (!strcmp(string, "CMYK"))
           ppd->colorspace = PPD_CS_CMYK;
-	else if (strcmp(string, "RGB") == 0)
+	else if (!strcmp(string, "RGB"))
           ppd->colorspace = PPD_CS_RGB;
-	else if (strcmp(string, "RGBK") == 0)
+	else if (!strcmp(string, "RGBK"))
           ppd->colorspace = PPD_CS_RGBK;
-	else if (strcmp(string, "N") == 0)
+	else if (!strcmp(string, "N"))
           ppd->colorspace = PPD_CS_N;
 	else
           ppd->colorspace = PPD_CS_GRAY;
       }
-      else if (option && strcmp(keyword + 7, option->keyword) == 0)
+      else if (option && !strcmp(keyword + 7, option->keyword))
       {
        /*
         * Set the default as part of the current option...
 	*/
 
-        DEBUG_printf(("Setting %s to %s...\n", keyword, string));
+        DEBUG_printf(("2_ppdOpen: Setting %s to %s...", keyword, string));
 
         strlcpy(option->defchoice, string, sizeof(option->defchoice));
 
-        DEBUG_printf(("%s is now %s...\n", keyword, option->defchoice));
+        DEBUG_printf(("2_ppdOpen: %s is now %s...", keyword, option->defchoice));
       }
       else
       {
@@ -1327,23 +1719,28 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 
         if ((toption = ppdFindOption(ppd, keyword + 7)) != NULL)
 	{
-	  DEBUG_printf(("Setting %s to %s...\n", keyword, string));
+	  DEBUG_printf(("2_ppdOpen: Setting %s to %s...", keyword, string));
 	  strlcpy(toption->defchoice, string, sizeof(toption->defchoice));
 	}
       }
     }
-    else if (strcmp(keyword, "UIConstraints") == 0 ||
-             strcmp(keyword, "NonUIConstraints") == 0)
+    else if (!strcmp(keyword, "UIConstraints") ||
+             !strcmp(keyword, "NonUIConstraints"))
     {
+      if (!string)
+      {
+	pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	goto error;
+      }
+
       if (ppd->num_consts == 0)
-	constraint = calloc(1, sizeof(ppd_const_t));
+	constraint = calloc(2, sizeof(ppd_const_t));
       else
-	constraint = realloc(ppd->consts,
-	                     (ppd->num_consts + 1) * sizeof(ppd_const_t));
+	constraint = realloc(ppd->consts, (size_t)(ppd->num_consts + 2) * sizeof(ppd_const_t));
 
       if (constraint == NULL)
       {
-        ppd_status = PPD_ALLOC_ERROR;
+        pg->ppd_status = PPD_ALLOC_ERROR;
 
 	goto error;
       }
@@ -1358,64 +1755,156 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       {
         case 0 : /* Error */
 	case 1 : /* Error */
-	    ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	    pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
 	    goto error;
 
 	case 2 : /* Two options... */
+	   /*
+	    * Check for broken constraints like "* Option"...
+	    */
+
+	    if (pg->ppd_conform == PPD_CONFORM_STRICT &&
+	        (!strcmp(constraint->option1, "*") ||
+	         !strcmp(constraint->choice1, "*")))
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
+
 	   /*
 	    * The following strcpy's are safe, as optionN and
 	    * choiceN are all the same size (size defined by PPD spec...)
 	    */
 
 	    if (constraint->option1[0] == '*')
-	      cups_strcpy(constraint->option1, constraint->option1 + 1);
+	      _cups_strcpy(constraint->option1, constraint->option1 + 1);
+	    else if (pg->ppd_conform == PPD_CONFORM_STRICT)
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
 
 	    if (constraint->choice1[0] == '*')
-	      cups_strcpy(constraint->option2, constraint->choice1 + 1);
-	    else
-	      cups_strcpy(constraint->option2, constraint->choice1);
+	      _cups_strcpy(constraint->option2, constraint->choice1 + 1);
+	    else if (pg->ppd_conform == PPD_CONFORM_STRICT)
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
 
             constraint->choice1[0] = '\0';
             constraint->choice2[0] = '\0';
 	    break;
-	    
+
 	case 3 : /* Two options, one choice... */
 	   /*
-	    * The following cups_strcpy's are safe, as optionN and
+	    * Check for broken constraints like "* Option"...
+	    */
+
+	    if (pg->ppd_conform == PPD_CONFORM_STRICT &&
+	        (!strcmp(constraint->option1, "*") ||
+	         !strcmp(constraint->choice1, "*") ||
+	         !strcmp(constraint->option2, "*")))
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
+
+	   /*
+	    * The following _cups_strcpy's are safe, as optionN and
 	    * choiceN are all the same size (size defined by PPD spec...)
 	    */
 
 	    if (constraint->option1[0] == '*')
-	      cups_strcpy(constraint->option1, constraint->option1 + 1);
+	      _cups_strcpy(constraint->option1, constraint->option1 + 1);
+	    else if (pg->ppd_conform == PPD_CONFORM_STRICT)
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
 
 	    if (constraint->choice1[0] == '*')
 	    {
-	      cups_strcpy(constraint->choice2, constraint->option2);
-	      cups_strcpy(constraint->option2, constraint->choice1 + 1);
+	      if (pg->ppd_conform == PPD_CONFORM_STRICT &&
+	          constraint->option2[0] == '*')
+	      {
+		pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+		goto error;
+	      }
+
+	      _cups_strcpy(constraint->choice2, constraint->option2);
+	      _cups_strcpy(constraint->option2, constraint->choice1 + 1);
               constraint->choice1[0] = '\0';
 	    }
 	    else
 	    {
 	      if (constraint->option2[0] == '*')
-  	        cups_strcpy(constraint->option2, constraint->option2 + 1);
+  	        _cups_strcpy(constraint->option2, constraint->option2 + 1);
+	      else if (pg->ppd_conform == PPD_CONFORM_STRICT)
+	      {
+		pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+		goto error;
+	      }
 
               constraint->choice2[0] = '\0';
 	    }
 	    break;
-	    
+
 	case 4 : /* Two options, two choices... */
+	   /*
+	    * Check for broken constraints like "* Option"...
+	    */
+
+	    if (pg->ppd_conform == PPD_CONFORM_STRICT &&
+	        (!strcmp(constraint->option1, "*") ||
+	         !strcmp(constraint->choice1, "*") ||
+	         !strcmp(constraint->option2, "*") ||
+	         !strcmp(constraint->choice2, "*")))
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
+
 	    if (constraint->option1[0] == '*')
-	      cups_strcpy(constraint->option1, constraint->option1 + 1);
+	      _cups_strcpy(constraint->option1, constraint->option1 + 1);
+	    else if (pg->ppd_conform == PPD_CONFORM_STRICT)
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
+
+            if (pg->ppd_conform == PPD_CONFORM_STRICT &&
+	        constraint->choice1[0] == '*')
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
 
 	    if (constraint->option2[0] == '*')
-  	      cups_strcpy(constraint->option2, constraint->option2 + 1);
+  	      _cups_strcpy(constraint->option2, constraint->option2 + 1);
+	    else if (pg->ppd_conform == PPD_CONFORM_STRICT)
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
+
+            if (pg->ppd_conform == PPD_CONFORM_STRICT &&
+	        constraint->choice2[0] == '*')
+	    {
+	      pg->ppd_status = PPD_BAD_UI_CONSTRAINTS;
+	      goto error;
+	    }
 	    break;
       }
 
-      ppd_free(string);
+     /*
+      * Don't add this one as an attribute...
+      */
+
+      _cupsStrFree(string);
       string = NULL;
     }
-    else if (strcmp(keyword, "PaperDimension") == 0)
+    else if (!strcmp(keyword, "PaperDimension"))
     {
       if ((size = ppdPageSize(ppd, name)) == NULL)
 	size = ppd_add_size(ppd, name);
@@ -1426,17 +1915,18 @@ ppdOpen(FILE *fp)			/* I - File to read from */
         * Unable to add or find size!
 	*/
 
-        ppd_status = PPD_ALLOC_ERROR;
+        pg->ppd_status = PPD_ALLOC_ERROR;
 
 	goto error;
       }
 
-      sscanf(string, "%f%f", &(size->width), &(size->length));
+      size->width  = (float)_cupsStrScand(string, &sptr, loc);
+      size->length = (float)_cupsStrScand(sptr, NULL, loc);
 
-      ppd_free(string);
+      _cupsStrFree(string);
       string = NULL;
     }
-    else if (strcmp(keyword, "ImageableArea") == 0)
+    else if (!strcmp(keyword, "ImageableArea"))
     {
       if ((size = ppdPageSize(ppd, name)) == NULL)
 	size = ppd_add_size(ppd, name);
@@ -1447,25 +1937,27 @@ ppdOpen(FILE *fp)			/* I - File to read from */
         * Unable to add or find size!
 	*/
 
-        ppd_status = PPD_ALLOC_ERROR;
+        pg->ppd_status = PPD_ALLOC_ERROR;
 
 	goto error;
       }
 
-      sscanf(string, "%f%f%f%f", &(size->left), &(size->bottom),
-	     &(size->right), &(size->top));
+      size->left   = (float)_cupsStrScand(string, &sptr, loc);
+      size->bottom = (float)_cupsStrScand(sptr, &sptr, loc);
+      size->right  = (float)_cupsStrScand(sptr, &sptr, loc);
+      size->top    = (float)_cupsStrScand(sptr, NULL, loc);
 
-      ppd_free(string);
+      _cupsStrFree(string);
       string = NULL;
     }
     else if (option != NULL &&
              (mask & (PPD_KEYWORD | PPD_OPTION | PPD_STRING)) ==
 	         (PPD_KEYWORD | PPD_OPTION | PPD_STRING) &&
-	     strcmp(keyword, option->keyword) == 0)
+	     !strcmp(keyword, option->keyword))
     {
-      DEBUG_printf(("group = %p, subgroup = %p\n", group, subgroup));
+      DEBUG_printf(("2_ppdOpen: group=%p, subgroup=%p", group, subgroup));
 
-      if (strcmp(keyword, "PageSize") == 0)
+      if (!strcmp(keyword, "PageSize"))
       {
        /*
         * Add a page size...
@@ -1479,17 +1971,20 @@ ppdOpen(FILE *fp)			/* I - File to read from */
       * Add the option choice...
       */
 
-      choice = ppd_add_choice(option, name);
-
-      if (mask & PPD_TEXT)
+      if ((choice = ppd_add_choice(option, name)) == NULL)
       {
-        strlcpy(choice->text, text, sizeof(choice->text));
-        ppd_fix(choice->text);
+        pg->ppd_status = PPD_ALLOC_ERROR;
+
+	goto error;
       }
-      else if (strcmp(name, "True") == 0)
-        strcpy(choice->text, "Yes");
-      else if (strcmp(name, "False") == 0)
-        strcpy(choice->text, "No");
+
+      if (text[0])
+        cupsCharsetToUTF8((cups_utf8_t *)choice->text, text,
+	                   sizeof(choice->text), encoding);
+      else if (!strcmp(name, "True"))
+        strlcpy(choice->text, _("Yes"), sizeof(choice->text));
+      else if (!strcmp(name, "False"))
+        strlcpy(choice->text, _("No"), sizeof(choice->text));
       else
         strlcpy(choice->text, name, sizeof(choice->text));
 
@@ -1508,29 +2003,32 @@ ppdOpen(FILE *fp)			/* I - File to read from */
         (mask & (PPD_KEYWORD | PPD_STRING)) == (PPD_KEYWORD | PPD_STRING))
       ppd_add_attr(ppd, keyword, name, text, string);
     else
-    {
-      ppd_free(string);
-    }
+      _cupsStrFree(string);
   }
+
+ /*
+  * Check for a missing CloseGroup...
+  */
+
+  if (group && pg->ppd_conform == PPD_CONFORM_STRICT)
+  {
+    pg->ppd_status = PPD_MISSING_CLOSE_GROUP;
+    goto error;
+  }
+
+  ppd_free(line.buffer);
 
  /*
   * Reset language preferences...
   */
 
-  cupsLangFree(language);
-
-#ifdef LC_NUMERIC
-  _cupsRestoreLocale(LC_NUMERIC, oldlocale);
-#else
-  _cupsRestoreLocale(LC_ALL, oldlocale);
-#endif /* LC_NUMERIC */
-
 #ifdef DEBUG
-  if (!feof(fp))
-    printf("Premature EOF at %lu...\n", (unsigned long)ftell(fp));
+  if (!cupsFileEOF(fp))
+    DEBUG_printf(("1_ppdOpen: Premature EOF at %lu...\n",
+                  (unsigned long)cupsFileTell(fp)));
 #endif /* DEBUG */
 
-  if (ppd_status != PPD_OK)
+  if (pg->ppd_status != PPD_OK)
   {
    /*
     * Had an error reading the PPD file, cannot continue!
@@ -1541,91 +2039,52 @@ ppdOpen(FILE *fp)			/* I - File to read from */
     return (NULL);
   }
 
-#ifndef __APPLE__
  /*
-  * Make sure that all PPD files with an InputSlot option have an
-  * "auto" choice that maps to no specific tray or media type.
+  * Update the filters array as needed...
   */
 
-  if ((option = ppdFindOption(ppd, "InputSlot")) != NULL)
+  if (!ppd_update_filters(ppd, pg))
   {
-    for (i = 0; i < option->num_choices; i ++)
-      if (option->choices[i].code == NULL || !option->choices[i].code[0] ||
-          !strncasecmp(option->choices[i].choice, "Auto", 4))
-	break;
+    ppdClose(ppd);
 
-    if (i >= option->num_choices)
-    {
-     /*
-      * No "auto" input slot, add one...
-      */
-
-      choice = ppd_add_choice(option, "Auto");
-
-      strlcpy(choice->text, cupsLangString(language, CUPS_MSG_AUTO),
-              sizeof(choice->text));
-      choice->code = NULL;
-    }
+    return (NULL);
   }
-#endif /* !__APPLE__ */
 
  /*
-  * Set the option back-pointer for each choice...
+  * Create the sorted options array and set the option back-pointer for
+  * each choice and custom option...
   */
 
-#ifndef __APPLE__
-  qsort(ppd->groups, ppd->num_groups, sizeof(ppd_group_t),
-        (int (*)(const void *, const void *))ppd_compare_groups);
-#endif /* !__APPLE__ */
+  ppd->options = cupsArrayNew2((cups_array_func_t)ppd_compare_options, NULL,
+                               (cups_ahash_func_t)ppd_hash_option,
+			       PPD_HASHSIZE);
 
   for (i = ppd->num_groups, group = ppd->groups;
        i > 0;
        i --, group ++)
   {
-#ifndef __APPLE__
-    qsort(group->options, group->num_options, sizeof(ppd_option_t),
-          (int (*)(const void *, const void *))ppd_compare_options);
-#endif /* !__APPLE__ */
-
     for (j = group->num_options, option = group->options;
          j > 0;
 	 j --, option ++)
     {
+      ppd_coption_t	*coption;	/* Custom option */
+
+
+      cupsArrayAdd(ppd->options, option);
+
       for (k = 0; k < option->num_choices; k ++)
-        option->choices[k].option = (void *)option;
-    }
+        option->choices[k].option = option;
 
-#ifndef __APPLE__
-    qsort(group->subgroups, group->num_subgroups, sizeof(ppd_group_t),
-          (int (*)(const void *, const void *))ppd_compare_groups);
-#endif /* !__APPLE__ */
-
-    for (j = group->num_subgroups, subgroup = group->subgroups;
-         j > 0;
-	 j --, subgroup ++)
-    {
-#ifndef __APPLE__
-      qsort(subgroup->options, subgroup->num_options, sizeof(ppd_option_t),
-            (int (*)(const void *, const void *))ppd_compare_options);
-#endif /* !__APPLE__ */
-
-      for (k = group->num_options, option = group->options;
-           k > 0;
-	   k --, option ++)
-      {
-        for (m = 0; m < option->num_choices; m ++)
-          option->choices[m].option = (void *)option;
-      }
+      if ((coption = ppdFindCustomOption(ppd, option->keyword)) != NULL)
+        coption->option = option;
     }
   }
 
  /*
-  * Sort the attributes...
+  * Create an array to track the marked choices...
   */
 
-  if (ppd->num_attrs > 1)
-    qsort(ppd->attrs, ppd->num_attrs, sizeof(ppd_attr_t *),
-          (int (*)(const void *, const void *))_ppd_attr_compare);
+  ppd->marked = cupsArrayNew((cups_array_func_t)ppd_compare_choices, NULL);
 
  /*
   * Return the PPD file structure...
@@ -1639,19 +2098,59 @@ ppdOpen(FILE *fp)			/* I - File to read from */
 
   error:
 
-  ppd_free(string);
+  _cupsStrFree(string);
+  ppd_free(line.buffer);
 
   ppdClose(ppd);
 
-  cupsLangFree(language);
-
-#ifdef LC_NUMERIC
-  _cupsRestoreLocale(LC_NUMERIC, oldlocale);
-#else
-  _cupsRestoreLocale(LC_ALL, oldlocale);
-#endif /* LC_NUMERIC */
-
   return (NULL);
+}
+
+
+/*
+ * 'ppdOpen()' - Read a PPD file into memory.
+ */
+
+ppd_file_t *				/* O - PPD file record */
+ppdOpen(FILE *fp)			/* I - File to read from */
+{
+  ppd_file_t	*ppd;			/* PPD file record */
+  cups_file_t	*cf;			/* CUPS file */
+
+
+ /*
+  * Reopen the stdio file as a CUPS file...
+  */
+
+  if ((cf = cupsFileOpenFd(fileno(fp), "r")) == NULL)
+    return (NULL);
+
+ /*
+  * Load the PPD file using the newer API...
+  */
+
+  ppd = _ppdOpen(cf, _PPD_LOCALIZATION_DEFAULT);
+
+ /*
+  * Close the CUPS file and return the PPD...
+  */
+
+  cupsFileClose(cf);
+
+  return (ppd);
+}
+
+
+/*
+ * 'ppdOpen2()' - Read a PPD file into memory.
+ *
+ * @since CUPS 1.2/macOS 10.5@
+ */
+
+ppd_file_t *				/* O - PPD file record or @code NULL@ if the PPD file could not be opened. */
+ppdOpen2(cups_file_t *fp)		/* I - File to read from */
+{
+  return _ppdOpen(fp, _PPD_LOCALIZATION_DEFAULT);
 }
 
 
@@ -1659,18 +2158,20 @@ ppdOpen(FILE *fp)			/* I - File to read from */
  * 'ppdOpenFd()' - Read a PPD file into memory.
  */
 
-ppd_file_t *				/* O - PPD file record */
+ppd_file_t *				/* O - PPD file record or @code NULL@ if the PPD file could not be opened. */
 ppdOpenFd(int fd)			/* I - File to read from */
 {
-  FILE		*fp;			/* File pointer */
-  ppd_file_t	*ppd;			/* PPD file record */
+  cups_file_t		*fp;		/* CUPS file pointer */
+  ppd_file_t		*ppd;		/* PPD file record */
+  _ppd_globals_t	*pg = _ppdGlobals();
+					/* Global data */
 
 
  /*
   * Set the line number to 0...
   */
 
-  ppd_line = 0;
+  pg->ppd_line = 0;
 
  /*
   * Range check input...
@@ -1678,7 +2179,7 @@ ppdOpenFd(int fd)			/* I - File to read from */
 
   if (fd < 0)
   {
-    ppd_status = PPD_NULL_FILE;
+    pg->ppd_status = PPD_NULL_FILE;
 
     return (NULL);
   }
@@ -1687,18 +2188,67 @@ ppdOpenFd(int fd)			/* I - File to read from */
   * Try to open the file and parse it...
   */
 
-  if ((fp = fdopen(fd, "r")) != NULL)
+  if ((fp = cupsFileOpenFd(fd, "r")) != NULL)
   {
-    setbuf(fp, NULL);
+    ppd = ppdOpen2(fp);
 
-    ppd = ppdOpen(fp);
-
-    fclose(fp);
+    cupsFileClose(fp);
   }
   else
   {
-    ppd_status = PPD_FILE_OPEN_ERROR;
-    ppd        = NULL;
+    pg->ppd_status = PPD_FILE_OPEN_ERROR;
+    ppd            = NULL;
+  }
+
+  return (ppd);
+}
+
+
+/*
+ * '_ppdOpenFile()' - Read a PPD file into memory.
+ */
+
+ppd_file_t *				/* O - PPD file record or @code NULL@ if the PPD file could not be opened. */
+_ppdOpenFile(const char		  *filename,	/* I - File to read from */
+	     _ppd_localization_t  localization)	/* I - Localization to load */
+{
+  cups_file_t		*fp;		/* File pointer */
+  ppd_file_t		*ppd;		/* PPD file record */
+  _ppd_globals_t	*pg = _ppdGlobals();
+					/* Global data */
+
+
+ /*
+  * Set the line number to 0...
+  */
+
+  pg->ppd_line = 0;
+
+ /*
+  * Range check input...
+  */
+
+  if (filename == NULL)
+  {
+    pg->ppd_status = PPD_NULL_FILE;
+
+    return (NULL);
+  }
+
+ /*
+  * Try to open the file and parse it...
+  */
+
+  if ((fp = cupsFileOpen(filename, "r")) != NULL)
+  {
+    ppd = _ppdOpen(fp, localization);
+
+    cupsFileClose(fp);
+  }
+  else
+  {
+    pg->ppd_status = PPD_FILE_OPEN_ERROR;
+    ppd            = NULL;
   }
 
   return (ppd);
@@ -1709,58 +2259,27 @@ ppdOpenFd(int fd)			/* I - File to read from */
  * 'ppdOpenFile()' - Read a PPD file into memory.
  */
 
-ppd_file_t *				/* O - PPD file record */
+ppd_file_t *				/* O - PPD file record or @code NULL@ if the PPD file could not be opened. */
 ppdOpenFile(const char *filename)	/* I - File to read from */
 {
-  FILE		*fp;			/* File pointer */
-  ppd_file_t	*ppd;			/* PPD file record */
-
-
- /*
-  * Set the line number to 0...
-  */
-
-  ppd_line = 0;
-
- /*
-  * Range check input...
-  */
-
-  if (filename == NULL)
-  {
-    ppd_status = PPD_NULL_FILE;
-
-    return (NULL);
-  }
-
- /*
-  * Try to open the file and parse it...
-  */
-
-  if ((fp = fopen(filename, "r")) != NULL)
-  {
-    ppd = ppdOpen(fp);
-
-    fclose(fp);
-  }
-  else
-  {
-    ppd_status = PPD_FILE_OPEN_ERROR;
-    ppd        = NULL;
-  }
-
-  return (ppd);
+  return _ppdOpenFile(filename, _PPD_LOCALIZATION_DEFAULT);
 }
 
 
 /*
  * 'ppdSetConformance()' - Set the conformance level for PPD files.
+ *
+ * @since CUPS 1.1.20/macOS 10.4@
  */
 
 void
 ppdSetConformance(ppd_conform_t c)	/* I - Conformance level */
 {
-  ppd_conform = c;
+  _ppd_globals_t	*pg = _ppdGlobals();
+					/* Global data */
+
+
+  pg->ppd_conform = c;
 }
 
 
@@ -1787,13 +2306,21 @@ ppd_add_attr(ppd_file_t *ppd,		/* I - PPD file data */
     return (NULL);
 
  /*
+  * Create the array as needed...
+  */
+
+  if (!ppd->sorted_attrs)
+    ppd->sorted_attrs = cupsArrayNew((cups_array_func_t)ppd_compare_attrs,
+                                     NULL);
+
+ /*
   * Allocate memory for the new attribute...
   */
 
   if (ppd->num_attrs == 0)
     ptr = malloc(sizeof(ppd_attr_t *));
   else
-    ptr = realloc(ppd->attrs, (ppd->num_attrs + 1) * sizeof(ppd_attr_t *));
+    ptr = realloc(ppd->attrs, (size_t)(ppd->num_attrs + 1) * sizeof(ppd_attr_t *));
 
   if (ptr == NULL)
     return (NULL);
@@ -1818,6 +2345,12 @@ ppd_add_attr(ppd_file_t *ppd,		/* I - PPD file data */
   temp->value = (char *)value;
 
  /*
+  * Add the attribute to the sorted array...
+  */
+
+  cupsArrayAdd(ppd->sorted_attrs, temp);
+
+ /*
   * Return the attribute...
   */
 
@@ -1839,8 +2372,7 @@ ppd_add_choice(ppd_option_t *option,	/* I - Option */
   if (option->num_choices == 0)
     choice = malloc(sizeof(ppd_choice_t));
   else
-    choice = realloc(option->choices,
-	             sizeof(ppd_choice_t) * (option->num_choices + 1));
+    choice = realloc(option->choices, sizeof(ppd_choice_t) * (size_t)(option->num_choices + 1));
 
   if (choice == NULL)
     return (NULL);
@@ -1870,7 +2402,7 @@ ppd_add_size(ppd_file_t *ppd,		/* I - PPD file */
   if (ppd->num_sizes == 0)
     size = malloc(sizeof(ppd_size_t));
   else
-    size = realloc(ppd->sizes, sizeof(ppd_size_t) * (ppd->num_sizes + 1));
+    size = realloc(ppd->sizes, sizeof(ppd_size_t) * (size_t)(ppd->num_sizes + 1));
 
   if (size == NULL)
     return (NULL);
@@ -1886,16 +2418,39 @@ ppd_add_size(ppd_file_t *ppd,		/* I - PPD file */
 }
 
 
-#ifndef __APPLE__
 /*
- * 'ppd_compare_groups()' - Compare two groups.
+ * 'ppd_compare_attrs()' - Compare two attributes.
  */
 
 static int				/* O - Result of comparison */
-ppd_compare_groups(ppd_group_t *g0,	/* I - First group */
-                   ppd_group_t *g1)	/* I - Second group */
+ppd_compare_attrs(ppd_attr_t *a,	/* I - First attribute */
+                  ppd_attr_t *b)	/* I - Second attribute */
 {
-  return (strcasecmp(g0->text, g1->text));
+  return (_cups_strcasecmp(a->name, b->name));
+}
+
+
+/*
+ * 'ppd_compare_choices()' - Compare two choices...
+ */
+
+static int				/* O - Result of comparison */
+ppd_compare_choices(ppd_choice_t *a,	/* I - First choice */
+                    ppd_choice_t *b)	/* I - Second choice */
+{
+  return (strcmp(a->option->keyword, b->option->keyword));
+}
+
+
+/*
+ * 'ppd_compare_coptions()' - Compare two custom options.
+ */
+
+static int				/* O - Result of comparison */
+ppd_compare_coptions(ppd_coption_t *a,	/* I - First option */
+                     ppd_coption_t *b)	/* I - Second option */
+{
+  return (_cups_strcasecmp(a->keyword, b->keyword));
 }
 
 
@@ -1904,12 +2459,11 @@ ppd_compare_groups(ppd_group_t *g0,	/* I - First group */
  */
 
 static int				/* O - Result of comparison */
-ppd_compare_options(ppd_option_t *o0,	/* I - First option */
-                    ppd_option_t *o1)	/* I - Second option */
+ppd_compare_options(ppd_option_t *a,	/* I - First option */
+                    ppd_option_t *b)	/* I - Second option */
 {
-  return (strcasecmp(o0->text, o1->text));
+  return (_cups_strcasecmp(a->keyword, b->keyword));
 }
-#endif /* !__APPLE__ */
 
 
 /*
@@ -1936,20 +2490,20 @@ ppd_decode(char *string)		/* I - String to decode */
       inptr ++;
       while (isxdigit(*inptr & 255))
       {
-	if (isalpha(*inptr))
-	  *outptr = (tolower(*inptr) - 'a' + 10) << 4;
+	if (_cups_isalpha(*inptr))
+	  *outptr = (char)((tolower(*inptr) - 'a' + 10) << 4);
 	else
-	  *outptr = (*inptr - '0') << 4;
+	  *outptr = (char)((*inptr - '0') << 4);
 
 	inptr ++;
 
         if (!isxdigit(*inptr & 255))
 	  break;
 
-	if (isalpha(*inptr))
-	  *outptr |= tolower(*inptr) - 'a' + 10;
+	if (_cups_isalpha(*inptr))
+	  *outptr |= (char)(tolower(*inptr) - 'a' + 10);
 	else
-	  *outptr |= *inptr - '0';
+	  *outptr |= (char)(*inptr - '0');
 
 	inptr ++;
 	outptr ++;
@@ -1965,62 +2519,32 @@ ppd_decode(char *string)		/* I - String to decode */
 
   *outptr = '\0';
 
-  return (outptr - string);
+  return ((int)(outptr - string));
 }
 
 
-#ifndef __APPLE__
 /*
- * 'ppd_fix()' - Fix WinANSI characters in the range 0x80 to 0x9f to be
- *               valid ISO-8859-1 characters...
+ * 'ppd_free_filters()' - Free the filters array.
  */
 
 static void
-ppd_fix(char *string)			/* IO - String to fix */
+ppd_free_filters(ppd_file_t *ppd)	/* I - PPD file */
 {
-  unsigned char		*p;		/* Pointer into string */
-  static const unsigned char lut[32] =	/* Lookup table for characters */
-			{
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  0x20,
-			  'l',
-			  '`',
-			  '\'',
-			  '^',
-			  '~',
-			  0x20, /* bar */
-			  0x20, /* circumflex */
-			  0x20, /* dot */
-			  0x20, /* double dot */
-			  0x20,
-			  0x20, /* circle */
-			  0x20, /* ??? */
-			  0x20,
-			  '\"', /* should be right quotes */
-			  0x20, /* ??? */
-			  0x20  /* accent */
-			};
+  int	i;				/* Looping var */
+  char	**filter;			/* Current filter */
 
 
-  for (p = (unsigned char *)string; *p; p ++)
-    if (*p >= 0x80 && *p < 0xa0)
-      *p = lut[*p - 0x80];
+  if (ppd->num_filters > 0)
+  {
+    for (i = ppd->num_filters, filter = ppd->filters; i > 0; i --, filter ++)
+      _cupsStrFree(*filter);
+
+    ppd_free(ppd->filters);
+
+    ppd->num_filters = 0;
+    ppd->filters     = NULL;
+  }
 }
-#endif /* !__APPLE__ */
 
 
 /*
@@ -2074,7 +2598,7 @@ ppd_free_option(ppd_option_t *option)	/* I - Option to free */
          i > 0;
          i --, choice ++)
     {
-      ppd_free(choice->code);
+      _cupsStrFree(choice->code);
     }
 
     ppd_free(option->choices);
@@ -2083,44 +2607,128 @@ ppd_free_option(ppd_option_t *option)	/* I - Option to free */
 
 
 /*
+ * 'ppd_get_coption()' - Get a custom option record.
+ */
+
+static ppd_coption_t	*		/* O - Custom option... */
+ppd_get_coption(ppd_file_t *ppd,	/* I - PPD file */
+                const char *name)	/* I - Name of option */
+{
+  ppd_coption_t	*copt;			/* New custom option */
+
+
+ /*
+  * See if the option already exists...
+  */
+
+  if ((copt = ppdFindCustomOption(ppd, name)) != NULL)
+    return (copt);
+
+ /*
+  * Not found, so create the custom option record...
+  */
+
+  if ((copt = calloc(1, sizeof(ppd_coption_t))) == NULL)
+    return (NULL);
+
+  strlcpy(copt->keyword, name, sizeof(copt->keyword));
+
+  copt->params = cupsArrayNew((cups_array_func_t)NULL, NULL);
+
+  cupsArrayAdd(ppd->coptions, copt);
+
+ /*
+  * Return the new record...
+  */
+
+  return (copt);
+}
+
+
+/*
+ * 'ppd_get_cparam()' - Get a custom parameter record.
+ */
+
+static ppd_cparam_t *			/* O - Extended option... */
+ppd_get_cparam(ppd_coption_t *opt,	/* I - PPD file */
+               const char    *param,	/* I - Name of parameter */
+	       const char    *text)	/* I - Human-readable text */
+{
+  ppd_cparam_t	*cparam;		/* New custom parameter */
+
+
+ /*
+  * See if the parameter already exists...
+  */
+
+  if ((cparam = ppdFindCustomParam(opt, param)) != NULL)
+    return (cparam);
+
+ /*
+  * Not found, so create the custom parameter record...
+  */
+
+  if ((cparam = calloc(1, sizeof(ppd_cparam_t))) == NULL)
+    return (NULL);
+
+  strlcpy(cparam->name, param, sizeof(cparam->name));
+  strlcpy(cparam->text, text[0] ? text : param, sizeof(cparam->text));
+
+ /*
+  * Add this record to the array...
+  */
+
+  cupsArrayAdd(opt->params, cparam);
+
+ /*
+  * Return the new record...
+  */
+
+  return (cparam);
+}
+
+
+/*
  * 'ppd_get_group()' - Find or create the named group as needed.
  */
 
 static ppd_group_t *			/* O - Named group */
-ppd_get_group(ppd_file_t *ppd,		/* I - PPD file */
-              const char *name,		/* I - Name of group */
-	      const char *text)		/* I - Text for group */
+ppd_get_group(ppd_file_t      *ppd,	/* I - PPD file */
+              const char      *name,	/* I - Name of group */
+	      const char      *text,	/* I - Text for group */
+              _ppd_globals_t  *pg,	/* I - Global data */
+	      cups_encoding_t encoding)	/* I - Encoding of text */
 {
   int		i;			/* Looping var */
   ppd_group_t	*group;			/* Group */
 
 
-  DEBUG_printf(("ppd_get_group(%p, \"%s\")\n", ppd, name));
+  DEBUG_printf(("7ppd_get_group(ppd=%p, name=\"%s\", text=\"%s\", cg=%p)",
+                ppd, name, text, pg));
 
   for (i = ppd->num_groups, group = ppd->groups; i > 0; i --, group ++)
-    if (strcmp(group->name, name) == 0)
+    if (!strcmp(group->name, name))
       break;
 
   if (i == 0)
   {
-    DEBUG_printf(("Adding group %s...\n", name));
+    DEBUG_printf(("8ppd_get_group: Adding group %s...", name));
 
-    if (ppd_conform == PPD_CONFORM_STRICT && strlen(text) >= sizeof(group->text))
+    if (pg->ppd_conform == PPD_CONFORM_STRICT && strlen(text) >= sizeof(group->text))
     {
-      ppd_status = PPD_ILLEGAL_TRANSLATION;
+      pg->ppd_status = PPD_ILLEGAL_TRANSLATION;
 
       return (NULL);
     }
-	    
+
     if (ppd->num_groups == 0)
       group = malloc(sizeof(ppd_group_t));
     else
-      group = realloc(ppd->groups,
-	              (ppd->num_groups + 1) * sizeof(ppd_group_t));
+      group = realloc(ppd->groups, (size_t)(ppd->num_groups + 1) * sizeof(ppd_group_t));
 
     if (group == NULL)
     {
-      ppd_status = PPD_ALLOC_ERROR;
+      pg->ppd_status = PPD_ALLOC_ERROR;
 
       return (NULL);
     }
@@ -2131,7 +2739,9 @@ ppd_get_group(ppd_file_t *ppd,		/* I - PPD file */
 
     memset(group, 0, sizeof(ppd_group_t));
     strlcpy(group->name, name, sizeof(group->name));
-    strlcpy(group->text, text, sizeof(group->text));
+
+    cupsCharsetToUTF8((cups_utf8_t *)group->text, text,
+	               sizeof(group->text), encoding);
   }
 
   return (group);
@@ -2150,11 +2760,11 @@ ppd_get_option(ppd_group_t *group,	/* I - Group */
   ppd_option_t	*option;		/* Option */
 
 
-  DEBUG_printf(("ppd_get_option(group=%p(\"%s\"), name=\"%s\")\n",
+  DEBUG_printf(("7ppd_get_option(group=%p(\"%s\"), name=\"%s\")",
                 group, group->name, name));
 
   for (i = group->num_options, option = group->options; i > 0; i --, option ++)
-    if (strcmp(option->keyword, name) == 0)
+    if (!strcmp(option->keyword, name))
       break;
 
   if (i == 0)
@@ -2162,8 +2772,7 @@ ppd_get_option(ppd_group_t *group,	/* I - Group */
     if (group->num_options == 0)
       option = malloc(sizeof(ppd_option_t));
     else
-      option = realloc(group->options,
-	               (group->num_options + 1) * sizeof(ppd_option_t));
+      option = realloc(group->options, (size_t)(group->num_options + 1) * sizeof(ppd_option_t));
 
     if (option == NULL)
       return (NULL);
@@ -2181,17 +2790,78 @@ ppd_get_option(ppd_group_t *group,	/* I - Group */
 
 
 /*
+ * 'ppd_globals_alloc()' - Allocate and initialize global data.
+ */
+
+static _ppd_globals_t *		/* O - Pointer to global data */
+ppd_globals_alloc(void)
+{
+  return ((_ppd_globals_t *)calloc(1, sizeof(_ppd_globals_t)));
+}
+
+
+/*
+ * 'ppd_globals_free()' - Free global data.
+ */
+
+#if defined(HAVE_PTHREAD_H) || defined(WIN32)
+static void
+ppd_globals_free(_ppd_globals_t *pg)	/* I - Pointer to global data */
+{
+  free(pg);
+}
+#endif /* HAVE_PTHREAD_H || WIN32 */
+
+
+#ifdef HAVE_PTHREAD_H
+/*
+ * 'ppd_globals_init()' - Initialize per-thread globals...
+ */
+
+static void
+ppd_globals_init(void)
+{
+ /*
+  * Register the global data for this thread...
+  */
+
+  pthread_key_create(&ppd_globals_key, (void (*)(void *))ppd_globals_free);
+}
+#endif /* HAVE_PTHREAD_H */
+
+
+/*
+ * 'ppd_hash_option()' - Generate a hash of the option name...
+ */
+
+static int				/* O - Hash index */
+ppd_hash_option(ppd_option_t *option)	/* I - Option */
+{
+  int		hash = 0;		/* Hash index */
+  const char	*k;			/* Pointer into keyword */
+
+
+  for (hash = option->keyword[0], k = option->keyword + 1; *k;)
+    hash = 33 * hash + *k++;
+
+  return (hash & 511);
+}
+
+
+/*
  * 'ppd_read()' - Read a line from a PPD file, skipping comment lines as
  *                necessary.
  */
 
 static int				/* O - Bitmask of fields read */
-ppd_read(FILE *fp,			/* I - File to read from */
-         char *keyword,			/* O - Keyword from line */
-	 char *option,			/* O - Option from line */
-         char *text,			/* O - Human-readable text from line */
-	 char **string,			/* O - Code/string data */
-         int  ignoreblank)		/* I - Ignore blank lines? */
+ppd_read(cups_file_t    *fp,		/* I - File to read from */
+         _ppd_line_t    *line,		/* I - Line buffer */
+         char           *keyword,	/* O - Keyword from line */
+	 char           *option,	/* O - Option from line */
+         char           *text,		/* O - Human-readable text from line */
+	 char           **string,	/* O - Code/string data */
+         int            ignoreblank,	/* I - Ignore blank lines? */
+	 _ppd_globals_t *pg)		/* I - Global data */
 {
   int		ch,			/* Character from file */
 		col,			/* Column in line */
@@ -2204,17 +2874,8 @@ ppd_read(FILE *fp,			/* I - File to read from */
 		*optptr,		/* Option pointer */
 		*textptr,		/* Text pointer */
 		*strptr,		/* Pointer into string */
-		*lineptr,		/* Current position in line buffer */
-		line[65536];		/* Line buffer (64k) */
+		*lineptr;		/* Current position in line buffer */
 
-
- /*
-  * Range check everything...
-  */
-
-  if (fp == NULL || keyword == NULL || option == NULL || text == NULL ||
-      string == NULL)
-    return (0);
 
  /*
   * Now loop until we have a valid line...
@@ -2222,7 +2883,16 @@ ppd_read(FILE *fp,			/* I - File to read from */
 
   *string   = NULL;
   col       = 0;
-  startline = ppd_line + 1;
+  startline = pg->ppd_line + 1;
+
+  if (!line->buffer)
+  {
+    line->bufsize = 1024;
+    line->buffer  = malloc(1024);
+
+    if (!line->buffer)
+      return (0);
+  }
 
   do
   {
@@ -2230,20 +2900,54 @@ ppd_read(FILE *fp,			/* I - File to read from */
     * Read the line...
     */
 
-    lineptr  = line;
+    lineptr  = line->buffer;
     endquote = 0;
     colon    = 0;
 
-    while ((ch = getc(fp)) != EOF &&
-           (lineptr - line) < (sizeof(line) - 1))
+    while ((ch = cupsFileGetChar(fp)) != EOF)
     {
+      if (lineptr >= (line->buffer + line->bufsize - 1))
+      {
+       /*
+        * Expand the line buffer...
+	*/
+
+        char *temp;			/* Temporary line pointer */
+
+
+        line->bufsize += 1024;
+	if (line->bufsize > 262144)
+	{
+	 /*
+	  * Don't allow lines longer than 256k!
+	  */
+
+          pg->ppd_line   = startline;
+          pg->ppd_status = PPD_LINE_TOO_LONG;
+
+	  return (0);
+	}
+
+        temp = realloc(line->buffer, line->bufsize);
+	if (!temp)
+	{
+          pg->ppd_line   = startline;
+          pg->ppd_status = PPD_LINE_TOO_LONG;
+
+	  return (0);
+	}
+
+        lineptr      = temp + (lineptr - line->buffer);
+	line->buffer = temp;
+      }
+
       if (ch == '\r' || ch == '\n')
       {
        /*
 	* Line feed or carriage return...
 	*/
 
-        ppd_line ++;
+        pg->ppd_line ++;
 	col = 0;
 
 	if (ch == '\r')
@@ -2252,13 +2956,17 @@ ppd_read(FILE *fp,			/* I - File to read from */
           * Check for a trailing line feed...
 	  */
 
-	  if ((ch = getc(fp)) == EOF)
+	  if ((ch = cupsFilePeekChar(fp)) == EOF)
+	  {
+	    ch = '\n';
 	    break;
-	  if (ch != 0x0a)
-	    ungetc(ch, fp);
+	  }
+
+	  if (ch == 0x0a)
+	    cupsFileGetChar(fp);
 	}
 
-	if (lineptr == line && ignoreblank)
+	if (lineptr == line->buffer && ignoreblank)
           continue;			/* Skip blank lines */
 
 	ch = '\n';
@@ -2268,14 +2976,14 @@ ppd_read(FILE *fp,			/* I - File to read from */
 
 	*lineptr++ = '\n';
       }
-      else if (ch < ' ' && ch != '\t' && ppd_conform == PPD_CONFORM_STRICT)
+      else if (ch < ' ' && ch != '\t' && pg->ppd_conform == PPD_CONFORM_STRICT)
       {
        /*
         * Other control characters...
 	*/
 
-        ppd_line   = startline;
-        ppd_status = PPD_ILLEGAL_CHARACTER;
+        pg->ppd_line   = startline;
+        pg->ppd_status = PPD_ILLEGAL_CHARACTER;
 
         return (0);
       }
@@ -2285,7 +2993,7 @@ ppd_read(FILE *fp,			/* I - File to read from */
 	* Any other character...
 	*/
 
-	*lineptr++ = ch;
+	*lineptr++ = (char)ch;
 	col ++;
 
 	if (col > (PPD_MAX_LINE - 1))
@@ -2294,13 +3002,13 @@ ppd_read(FILE *fp,			/* I - File to read from */
           * Line is too long...
 	  */
 
-          ppd_line   = startline;
-          ppd_status = PPD_LINE_TOO_LONG;
+          pg->ppd_line   = startline;
+          pg->ppd_status = PPD_LINE_TOO_LONG;
 
           return (0);
 	}
 
-	if (ch == ':' && strncmp(line, "*%", 2) != 0)
+	if (ch == ':' && strncmp(line->buffer, "*%", 2) != 0)
 	  colon = 1;
 
 	if (ch == '\"' && colon)
@@ -2314,12 +3022,12 @@ ppd_read(FILE *fp,			/* I - File to read from */
       * Didn't finish this quoted string...
       */
 
-      while ((ch = getc(fp)) != EOF)
+      while ((ch = cupsFileGetChar(fp)) != EOF)
         if (ch == '\"')
 	  break;
 	else if (ch == '\r' || ch == '\n')
 	{
-	  ppd_line ++;
+	  pg->ppd_line ++;
 	  col = 0;
 
 	  if (ch == '\r')
@@ -2328,22 +3036,20 @@ ppd_read(FILE *fp,			/* I - File to read from */
             * Check for a trailing line feed...
 	    */
 
-	    if ((ch = getc(fp)) == EOF)
+	    if ((ch = cupsFilePeekChar(fp)) == EOF)
 	      break;
-	    if (ch != 0x0a)
-	      ungetc(ch, fp);
+	    if (ch == 0x0a)
+	      cupsFileGetChar(fp);
 	  }
-
-	  ch = '\n';
 	}
-	else if (ch < ' ' && ch != '\t' && ppd_conform == PPD_CONFORM_STRICT)
+	else if (ch < ' ' && ch != '\t' && pg->ppd_conform == PPD_CONFORM_STRICT)
 	{
 	 /*
           * Other control characters...
 	  */
 
-          ppd_line   = startline;
-          ppd_status = PPD_ILLEGAL_CHARACTER;
+          pg->ppd_line   = startline;
+          pg->ppd_status = PPD_ILLEGAL_CHARACTER;
 
           return (0);
 	}
@@ -2357,8 +3063,8 @@ ppd_read(FILE *fp,			/* I - File to read from */
             * Line is too long...
 	    */
 
-            ppd_line   = startline;
-            ppd_status = PPD_LINE_TOO_LONG;
+            pg->ppd_line   = startline;
+            pg->ppd_status = PPD_LINE_TOO_LONG;
 
             return (0);
 	  }
@@ -2371,14 +3077,14 @@ ppd_read(FILE *fp,			/* I - File to read from */
       * Didn't finish this line...
       */
 
-      while ((ch = getc(fp)) != EOF)
+      while ((ch = cupsFileGetChar(fp)) != EOF)
 	if (ch == '\r' || ch == '\n')
 	{
 	 /*
 	  * Line feed or carriage return...
 	  */
 
-          ppd_line ++;
+          pg->ppd_line ++;
 	  col = 0;
 
 	  if (ch == '\r')
@@ -2387,22 +3093,22 @@ ppd_read(FILE *fp,			/* I - File to read from */
             * Check for a trailing line feed...
 	    */
 
-	    if ((ch = getc(fp)) == EOF)
+	    if ((ch = cupsFilePeekChar(fp)) == EOF)
 	      break;
-	    if (ch != 0x0a)
-	      ungetc(ch, fp);
+	    if (ch == 0x0a)
+	      cupsFileGetChar(fp);
 	  }
 
 	  break;
 	}
-	else if (ch < ' ' && ch != '\t' && ppd_conform == PPD_CONFORM_STRICT)
+	else if (ch < ' ' && ch != '\t' && pg->ppd_conform == PPD_CONFORM_STRICT)
 	{
 	 /*
           * Other control characters...
 	  */
 
-          ppd_line   = startline;
-          ppd_status = PPD_ILLEGAL_CHARACTER;
+          pg->ppd_line   = startline;
+          pg->ppd_status = PPD_ILLEGAL_CHARACTER;
 
           return (0);
 	}
@@ -2416,22 +3122,32 @@ ppd_read(FILE *fp,			/* I - File to read from */
             * Line is too long...
 	    */
 
-            ppd_line   = startline;
-            ppd_status = PPD_LINE_TOO_LONG;
+            pg->ppd_line   = startline;
+            pg->ppd_status = PPD_LINE_TOO_LONG;
 
             return (0);
 	  }
 	}
     }
 
-    if (lineptr > line && lineptr[-1] == '\n')
+    if (lineptr > line->buffer && lineptr[-1] == '\n')
       lineptr --;
 
     *lineptr = '\0';
 
-    DEBUG_printf(("LINE = \"%s\"\n", line));
+    DEBUG_printf(("9ppd_read: LINE=\"%s\"", line->buffer));
 
-    if (ch == EOF && lineptr == line)
+   /*
+    * The dynamically created PPDs for older style macOS
+    * drivers include a large blob of data inserted as comments
+    * at the end of the file.  As an optimization we can stop
+    * reading the PPD when we get to the start of this data.
+    */
+
+    if (!strcmp(line->buffer, "*%APLWORKSET START"))
+      return (0);
+
+    if (ch == EOF && lineptr == line->buffer)
       return (0);
 
    /*
@@ -2439,57 +3155,51 @@ ppd_read(FILE *fp,			/* I - File to read from */
     */
 
     mask    = 0;
-    lineptr = line + 1;
+    lineptr = line->buffer + 1;
 
     keyword[0] = '\0';
     option[0]  = '\0';
     text[0]    = '\0';
     *string    = NULL;
 
-    if ((!line[0] ||			/* Blank line */
-         strncmp(line, "*%", 2) == 0 ||	/* Comment line */
-         strcmp(line, "*End") == 0) &&	/* End of multi-line string */
+    if ((!line->buffer[0] ||		/* Blank line */
+         !strncmp(line->buffer, "*%", 2) || /* Comment line */
+         !strcmp(line->buffer, "*End")) && /* End of multi-line string */
         ignoreblank)			/* Ignore these? */
     {
-      startline = ppd_line + 1;
+      startline = pg->ppd_line + 1;
       continue;
     }
 
-    if (strcmp(line, "*") == 0)		/* (Bad) comment line */
+    if (!strcmp(line->buffer, "*"))	/* (Bad) comment line */
     {
-      if (ppd_conform == PPD_CONFORM_RELAXED)
+      if (pg->ppd_conform == PPD_CONFORM_RELAXED)
       {
-	startline = ppd_line + 1;
+	startline = pg->ppd_line + 1;
 	continue;
       }
       else
       {
-        ppd_line   = startline;
-        ppd_status = PPD_ILLEGAL_MAIN_KEYWORD;
+        pg->ppd_line   = startline;
+        pg->ppd_status = PPD_ILLEGAL_MAIN_KEYWORD;
 
         return (0);
       }
     }
 
-    if (line[0] != '*')			/* All lines start with an asterisk */
+    if (line->buffer[0] != '*')		/* All lines start with an asterisk */
     {
-      if (ppd_conform == PPD_CONFORM_STRICT)
-      {
-        ppd_status = PPD_MISSING_ASTERISK;
-        return (0);
-      }
-
      /*
       * Allow lines consisting of just whitespace...
       */
 
-      for (lineptr = line; *lineptr; lineptr ++)
-        if (!isspace(*lineptr & 255))
+      for (lineptr = line->buffer; *lineptr; lineptr ++)
+        if (*lineptr && !_cups_isspace(*lineptr))
 	  break;
 
       if (*lineptr)
       {
-        ppd_status = PPD_MISSING_ASTERISK;
+        pg->ppd_status = PPD_MISSING_ASTERISK;
         return (0);
       }
       else if (ignoreblank)
@@ -2504,12 +3214,12 @@ ppd_read(FILE *fp,			/* I - File to read from */
 
     keyptr = keyword;
 
-    while (*lineptr != '\0' && *lineptr != ':' && !isspace(*lineptr & 255))
+    while (*lineptr && *lineptr != ':' && !_cups_isspace(*lineptr))
     {
       if (*lineptr <= ' ' || *lineptr > 126 || *lineptr == '/' ||
           (keyptr - keyword) >= (PPD_MAX_NAME - 1))
       {
-        ppd_status = PPD_ILLEGAL_MAIN_KEYWORD;
+        pg->ppd_status = PPD_ILLEGAL_MAIN_KEYWORD;
 	return (0);
       }
 
@@ -2518,31 +3228,29 @@ ppd_read(FILE *fp,			/* I - File to read from */
 
     *keyptr = '\0';
 
-    if (strcmp(keyword, "End") == 0)
+    if (!strcmp(keyword, "End"))
       continue;
 
     mask |= PPD_KEYWORD;
 
-/*    DEBUG_printf(("keyword = \"%s\", lineptr = \"%s\"\n", keyword, lineptr));*/
-
-    if (isspace(*lineptr & 255))
+    if (_cups_isspace(*lineptr))
     {
      /*
       * Get an option name...
       */
 
-      while (isspace(*lineptr & 255))
+      while (_cups_isspace(*lineptr))
         lineptr ++;
 
       optptr = option;
 
-      while (*lineptr != '\0' && !isspace(*lineptr & 255) && *lineptr != ':' &&
+      while (*lineptr && !_cups_isspace(*lineptr) && *lineptr != ':' &&
              *lineptr != '/')
       {
 	if (*lineptr <= ' ' || *lineptr > 126 ||
 	    (optptr - option) >= (PPD_MAX_NAME - 1))
         {
-          ppd_status = PPD_ILLEGAL_OPTION_KEYWORD;
+          pg->ppd_status = PPD_ILLEGAL_OPTION_KEYWORD;
 	  return (0);
 	}
 
@@ -2551,18 +3259,16 @@ ppd_read(FILE *fp,			/* I - File to read from */
 
       *optptr = '\0';
 
-      if (isspace(*lineptr & 255) && ppd_conform == PPD_CONFORM_STRICT)
+      if (_cups_isspace(*lineptr) && pg->ppd_conform == PPD_CONFORM_STRICT)
       {
-        ppd_status = PPD_ILLEGAL_WHITESPACE;
+        pg->ppd_status = PPD_ILLEGAL_WHITESPACE;
 	return (0);
       }
 
-      while (isspace(*lineptr & 255))
+      while (_cups_isspace(*lineptr))
 	lineptr ++;
 
       mask |= PPD_OPTION;
-
-/*      DEBUG_printf(("option = \"%s\", lineptr = \"%s\"\n", option, lineptr));*/
 
       if (*lineptr == '/')
       {
@@ -2571,7 +3277,7 @@ ppd_read(FILE *fp,			/* I - File to read from */
 	*/
 
         lineptr ++;
-	
+
 	textptr = text;
 
 	while (*lineptr != '\0' && *lineptr != '\n' && *lineptr != ':')
@@ -2579,7 +3285,7 @@ ppd_read(FILE *fp,			/* I - File to read from */
 	  if (((unsigned char)*lineptr < ' ' && *lineptr != '\t') ||
 	      (textptr - text) >= (PPD_MAX_LINE - 1))
 	  {
-	    ppd_status = PPD_ILLEGAL_TRANSLATION;
+	    pg->ppd_status = PPD_ILLEGAL_TRANSLATION;
 	    return (0);
 	  }
 
@@ -2589,25 +3295,23 @@ ppd_read(FILE *fp,			/* I - File to read from */
 	*textptr = '\0';
 	textlen  = ppd_decode(text);
 
-	if (textlen > PPD_MAX_TEXT && ppd_conform == PPD_CONFORM_STRICT)
+	if (textlen > PPD_MAX_TEXT && pg->ppd_conform == PPD_CONFORM_STRICT)
 	{
-	  ppd_status = PPD_ILLEGAL_TRANSLATION;
+	  pg->ppd_status = PPD_ILLEGAL_TRANSLATION;
 	  return (0);
 	}
-	    
+
 	mask |= PPD_TEXT;
       }
-
-/*      DEBUG_printf(("text = \"%s\", lineptr = \"%s\"\n", text, lineptr));*/
     }
 
-    if (isspace(*lineptr & 255) && ppd_conform == PPD_CONFORM_STRICT)
+    if (_cups_isspace(*lineptr) && pg->ppd_conform == PPD_CONFORM_STRICT)
     {
-      ppd_status = PPD_ILLEGAL_WHITESPACE;
+      pg->ppd_status = PPD_ILLEGAL_WHITESPACE;
       return (0);
     }
 
-    while (isspace(*lineptr & 255))
+    while (_cups_isspace(*lineptr))
       lineptr ++;
 
     if (*lineptr == ':')
@@ -2617,33 +3321,24 @@ ppd_read(FILE *fp,			/* I - File to read from */
       */
 
       lineptr ++;
-      while (isspace(*lineptr & 255))
+      while (_cups_isspace(*lineptr))
         lineptr ++;
 
       strptr = lineptr + strlen(lineptr) - 1;
-      while (strptr >= lineptr && isspace(*strptr & 255))
+      while (strptr >= lineptr && _cups_isspace(*strptr))
         *strptr-- = '\0';
 
       if (*strptr == '\"')
       {
        /*
-        * Quoted string by itself...
+        * Quoted string by itself, remove quotes...
 	*/
 
-	*string = malloc(strlen(lineptr) + 1);
-
-	strptr = *string;
-
-	for (; *lineptr != '\0'; lineptr ++)
-	  if (*lineptr != '\"')
-	    *strptr++ = *lineptr;
-
-	*strptr = '\0';
+        *strptr = '\0';
+	lineptr ++;
       }
-      else
-        *string = strdup(lineptr);
 
-/*      DEBUG_printf(("string = \"%s\", lineptr = \"%s\"\n", *string, lineptr));*/
+      *string = _cupsStrAlloc(lineptr);
 
       mask |= PPD_STRING;
     }
@@ -2655,5 +3350,120 @@ ppd_read(FILE *fp,			/* I - File to read from */
 
 
 /*
- * End of "$Id: ppd.c,v 1.117 2004/02/25 20:14:51 mike Exp $".
+ * 'ppd_update_filters()' - Update the filters array as needed.
+ *
+ * This function re-populates the filters array with cupsFilter2 entries that
+ * have been stripped of the destination MIME media types and any maxsize hints.
+ *
+ * (All for backwards-compatibility)
  */
+
+static int				/* O - 1 on success, 0 on failure */
+ppd_update_filters(ppd_file_t     *ppd,	/* I - PPD file */
+                   _ppd_globals_t *pg)	/* I - Global data */
+{
+  ppd_attr_t	*attr;			/* Current cupsFilter2 value */
+  char		srcsuper[16],		/* Source MIME media type */
+		srctype[256],
+		dstsuper[16],		/* Destination MIME media type */
+		dsttype[256],
+		program[1024],		/* Command to run */
+		*ptr,			/* Pointer into command to run */
+		buffer[1024],		/* Re-written cupsFilter value */
+		**filter;		/* Current filter */
+  int		cost;			/* Cost of filter */
+
+
+  DEBUG_printf(("4ppd_update_filters(ppd=%p, cg=%p)", ppd, pg));
+
+ /*
+  * See if we have any cupsFilter2 lines...
+  */
+
+  if ((attr = ppdFindAttr(ppd, "cupsFilter2", NULL)) == NULL)
+  {
+    DEBUG_puts("5ppd_update_filters: No cupsFilter2 keywords present.");
+    return (1);
+  }
+
+ /*
+  * Yes, free the cupsFilter-defined filters and re-build...
+  */
+
+  ppd_free_filters(ppd);
+
+  do
+  {
+   /*
+    * Parse the cupsFilter2 string:
+    *
+    *   src/type dst/type cost program
+    *   src/type dst/type cost maxsize(n) program
+    */
+
+    DEBUG_printf(("5ppd_update_filters: cupsFilter2=\"%s\"", attr->value));
+
+    if (sscanf(attr->value, "%15[^/]/%255s%*[ \t]%15[^/]/%255s%d%*[ \t]%1023[^\n]",
+	       srcsuper, srctype, dstsuper, dsttype, &cost, program) != 6)
+    {
+      DEBUG_puts("5ppd_update_filters: Bad cupsFilter2 line.");
+      pg->ppd_status = PPD_BAD_VALUE;
+
+      return (0);
+    }
+
+    DEBUG_printf(("5ppd_update_filters: srcsuper=\"%s\", srctype=\"%s\", "
+                  "dstsuper=\"%s\", dsttype=\"%s\", cost=%d, program=\"%s\"",
+		  srcsuper, srctype, dstsuper, dsttype, cost, program));
+
+    if (!strncmp(program, "maxsize(", 8) &&
+        (ptr = strchr(program + 8, ')')) != NULL)
+    {
+      DEBUG_puts("5ppd_update_filters: Found maxsize(nnn).");
+
+      ptr ++;
+      while (_cups_isspace(*ptr))
+	ptr ++;
+
+      _cups_strcpy(program, ptr);
+      DEBUG_printf(("5ppd_update_filters: New program=\"%s\"", program));
+    }
+
+   /*
+    * Convert to cupsFilter format:
+    *
+    *   src/type cost program
+    */
+
+    snprintf(buffer, sizeof(buffer), "%s/%s %d %s", srcsuper, srctype, cost,
+             program);
+    DEBUG_printf(("5ppd_update_filters: Adding \"%s\".", buffer));
+
+   /*
+    * Add a cupsFilter-compatible string to the filters array.
+    */
+
+    if (ppd->num_filters == 0)
+      filter = malloc(sizeof(char *));
+    else
+      filter = realloc(ppd->filters, sizeof(char *) * (size_t)(ppd->num_filters + 1));
+
+    if (filter == NULL)
+    {
+      DEBUG_puts("5ppd_update_filters: Out of memory.");
+      pg->ppd_status = PPD_ALLOC_ERROR;
+
+      return (0);
+    }
+
+    ppd->filters     = filter;
+    filter           += ppd->num_filters;
+    ppd->num_filters ++;
+
+    *filter = _cupsStrAlloc(buffer);
+  }
+  while ((attr = ppdFindNextAttr(ppd, "cupsFilter2", NULL)) != NULL);
+
+  DEBUG_puts("5ppd_update_filters: Completed OK.");
+  return (1);
+}

@@ -67,6 +67,7 @@ CUPS_GROUP	=	sys
 
 LIBCUPS		=	libcups.so.2
 LIBCUPSIMAGE	=	libcupsimage.so.2
+LIBCUPSSTATIC = libcups.a
 LIBJPEG		=	-ljpeg
 LIBMALLOC	=	
 LIBPAPER	=	
@@ -86,7 +87,7 @@ LIBZ		=	-lz
 ARFLAGS		=	crvs
 BACKLIBS	=	
 CFLAGS		=	$(RC_CFLAGS) $(SSLFLAGS)   -I.. $(OPTIONS)
-COMMONLIBS	=	
+COMMONLIBS	=	-lregex
 CXXFLAGS	=	$(RC_CFLAGS)   -I.. $(OPTIONS)
 CXXLIBS		=	-lsupc++
 DSOFLAGS	=	-Wl,-rpath,/usr/lib  -Wl,-soname,$@ -shared $(OPTIM)
@@ -98,10 +99,11 @@ LINKCUPSIMAGE	=	-lcupsimage
 LIBS		=	$(LINKCUPS) $(NETLIBS) -lcrypt  $(COMMONLIBS)
 NETLIBS		=	 
 OPTIM		=	-Wall -fPIC -O2
-OPTIONS		=	-gstabs
+OPTIONS		=	-DDEBUG -D_IPP_PRIVATE_STRUCTURES=1
+#-gstabs
 PAMLIBS		=	-lpam -ldl
 SSLFLAGS	=	
-SSLLIBS		=	
+SSLLIBS		=	-lssl -lcrypto
 
 #
 # Directories...

@@ -4,10 +4,10 @@
 
 CC		= ppc-amigaos-gcc
 CPP		= ppc-amigaos-g++
-CFLAGS	= -N -Wall -O2 -fomit-frame-pointer -c -fno-builtin -gstabs \
+CFLAGS	= -N -Wall -O2 -fomit-frame-pointer -c -fno-builtin \
 		  -mmultiple -Wunused -D__USE_INLINE__ -D__NOGLOBALIFACE__ -I..
 LDFLAGS	= -nostartfiles
-LDLIBS	= ../cups/libcups.a -lstdc++
+LDLIBS	= ../cups/libcups.a -lssl -lcrypto -lz -lregex -lstdc++
 OBJS	= ipp_dev.o dev_68k.o ../ipr/ipr.o ../ipr/iprutil.o ../ipr/AttrGroups.o
 
 ipp.device:	$(OBJS)

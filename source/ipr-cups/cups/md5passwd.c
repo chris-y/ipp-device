@@ -1,57 +1,39 @@
 /*
- * "$Id: md5passwd.c,v 1.11 2004/02/25 20:14:51 mike Exp $"
+ * MD5 password support for CUPS.
  *
- *   MD5 password support for the Common UNIX Printing System (CUPS).
+ * Copyright 2007-2010 by Apple Inc.
+ * Copyright 1997-2005 by Easy Software Products.
  *
- *   Copyright 1997-2004 by Easy Software Products.
+ * These coded instructions, statements, and computer programs are the
+ * property of Apple Inc. and are protected by Federal copyright
+ * law.  Distribution and use rights are outlined in the file "LICENSE.txt"
+ * which should have been included with this file.  If this file is
+ * missing or damaged, see the license at "http://www.cups.org/".
  *
- *   These coded instructions, statements, and computer programs are the
- *   property of Easy Software Products and are protected by Federal
- *   copyright law.  Distribution and use rights are outlined in the file
- *   "LICENSE.txt" which should have been included with this file.  If this
- *   file is missing or damaged please contact Easy Software Products
- *   at:
- *
- *       Attn: CUPS Licensing Information
- *       Easy Software Products
- *       44141 Airport View Drive, Suite 204
- *       Hollywood, Maryland 20636-3111 USA
- *
- *       Voice: (301) 373-9603
- *       EMail: cups-info@cups.org
- *         WWW: http://www.cups.org
- *
- *   This file is subject to the Apple OS-Developed Software exception.
- *
- * Contents:
- *
- *   httpMD5()       - Compute the MD5 sum of the username:group:password.
- *   httpMD5Nonce()  - Combine the MD5 sum of the username, group, and password
- *                     with the server-supplied nonce value.
- *   httpMD5String() - Convert an MD5 sum to a character string.
+ * This file is subject to the Apple OS-Developed Software exception.
  */
 
 /*
  * Include necessary headers...
  */
 
-#include "http.h"
-#include "string.h"
+#include "http-private.h"
+#include "string-private.h"
 
 
 /*
  * 'httpMD5()' - Compute the MD5 sum of the username:group:password.
  */
 
-char *				/* O - MD5 sum */
-httpMD5(const char *username,	/* I - User name */
-        const char *realm,	/* I - Realm name */
-        const char *passwd,	/* I - Password string */
-	char       md5[33])	/* O - MD5 string */
+char *					/* O - MD5 sum */
+httpMD5(const char *username,		/* I - User name */
+        const char *realm,		/* I - Realm name */
+        const char *passwd,		/* I - Password string */
+	char       md5[33])		/* O - MD5 string */
 {
-  md5_state_t	state;		/* MD5 state info */
-  md5_byte_t	sum[16];	/* Sum data */
-  char		line[256];	/* Line to sum */
+  _cups_md5_state_t	state;		/* MD5 state info */
+  unsigned char		sum[16];	/* Sum data */
+  char			line[256];	/* Line to sum */
 
 
  /*
@@ -59,9 +41,9 @@ httpMD5(const char *username,	/* I - User name */
   */
 
   snprintf(line, sizeof(line), "%s:%s:%s", username, realm, passwd);
-  md5_init(&state);
-  md5_append(&state, (md5_byte_t *)line, strlen(line));
-  md5_finish(&state, sum);
+  _cupsMD5Init(&state);
+  _cupsMD5Append(&state, (unsigned char *)line, (int)strlen(line));
+  _cupsMD5Finish(&state, sum);
 
  /*
   * Return the sum...
@@ -83,10 +65,10 @@ httpMD5Final(const char *nonce,		/* I - Server nonce value */
 	     const char *resource,	/* I - Resource path */
              char       md5[33])	/* IO - MD5 sum */
 {
-  md5_state_t	state;			/* MD5 state info */
-  md5_byte_t	sum[16];		/* Sum data */
-  char		line[1024];		/* Line of data */
-  char		a2[33];			/* Hash of method and resource */
+  _cups_md5_state_t	state;		/* MD5 state info */
+  unsigned char		sum[16];	/* Sum data */
+  char			line[1024];	/* Line of data */
+  char			a2[33];		/* Hash of method and resource */
 
 
  /*
@@ -94,9 +76,9 @@ httpMD5Final(const char *nonce,		/* I - Server nonce value */
   */
 
   snprintf(line, sizeof(line), "%s:%s", method, resource);
-  md5_init(&state);
-  md5_append(&state, (md5_byte_t *)line, strlen(line));
-  md5_finish(&state, sum);
+  _cupsMD5Init(&state);
+  _cupsMD5Append(&state, (unsigned char *)line, (int)strlen(line));
+  _cupsMD5Finish(&state, sum);
   httpMD5String(sum, a2);
 
  /*
@@ -107,9 +89,9 @@ httpMD5Final(const char *nonce,		/* I - Server nonce value */
 
   snprintf(line, sizeof(line), "%s:%s:%s", md5, nonce, a2);
 
-  md5_init(&state);
-  md5_append(&state, (md5_byte_t *)line, strlen(line));
-  md5_finish(&state, sum);
+  _cupsMD5Init(&state);
+  _cupsMD5Append(&state, (unsigned char *)line, (int)strlen(line));
+  _cupsMD5Finish(&state, sum);
 
   return (httpMD5String(sum, md5));
 }
@@ -120,8 +102,9 @@ httpMD5Final(const char *nonce,		/* I - Server nonce value */
  */
 
 char *					/* O - MD5 sum in hex */
-httpMD5String(const md5_byte_t *sum,	/* I - MD5 sum data */
-              char             md5[33])	/* O - MD5 sum in hex */
+httpMD5String(const unsigned char *sum,	/* I - MD5 sum data */
+              char                md5[33])
+					/* O - MD5 sum in hex */
 {
   int		i;			/* Looping var */
   char		*md5ptr;		/* Pointer into MD5 string */
@@ -143,8 +126,3 @@ httpMD5String(const md5_byte_t *sum,	/* I - MD5 sum data */
 
   return (md5);
 }
-
-
-/*
- * End of "$Id: md5passwd.c,v 1.11 2004/02/25 20:14:51 mike Exp $".
- */

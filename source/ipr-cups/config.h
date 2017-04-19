@@ -33,7 +33,11 @@
  */
 
 #define CUPS_SVERSION "CUPS v1.1.21rc1"
+#define CUPS_MINIMAL	""
 
+#ifndef SHUT_RD
+#define SHUT_RD 0
+#endif
 
 /*
  * Default user and group...
@@ -41,6 +45,12 @@
 
 #define CUPS_DEFAULT_USER "lp"
 #define CUPS_DEFAULT_GROUP "sys"
+
+/*
+ * Default IPP port...
+ */
+
+#define CUPS_DEFAULT_IPP_PORT	631
 
 
 /*
@@ -59,10 +69,10 @@
 #define CUPS_SERVERBIN "/usr/lib/cups"
 #define CUPS_DOCROOT "/usr/share/doc/cups"
 #define CUPS_REQUESTS "/var/spool/cups"
-#define CUPS_LOGDIR "/var/log/cups"
+#define CUPS_LOGDIR "t:cups.log"
 #define CUPS_DATADIR "/usr/share/cups"
 #define CUPS_FONTPATH "/usr/share/cups/fonts"
-
+#define CUPS_STATEDIR	"/var/run/cups"
 
 /*
  * What is the format string for strftime?
@@ -86,7 +96,21 @@
  */
 
 /* #undef WORDS_BIGENDIAN */
+#define WORDS_BIGENDIAN 1
 
+/*
+ * Do we have the long long type?
+ */
+
+#define HAVE_LONG_LONG 1
+
+#ifdef HAVE_LONG_LONG
+#  define CUPS_LLFMT	"%lld"
+#  define CUPS_LLCAST	(long long)
+#else
+#  define CUPS_LLFMT	"%ld"
+#  define CUPS_LLCAST	(long)
+#endif /* HAVE_LONG_LONG */
 
 /*
  * Which directory functions and headers do we use?
@@ -103,7 +127,7 @@
  */
 
 #ifndef HAVE_LIBPAM
-#define HAVE_LIBPAM 1
+#define HAVE_LIBPAM 0
 #endif /* !HAVE_LIBPAM */
 
 /* #undef HAVE_PAM_PAM_APPL_H */
@@ -190,7 +214,7 @@
 /* #undef HAVE_GNUTLS */
 /* #undef HAVE_LIBSSL */
 /* #undef HAVE_SSL */
-
+#define HAVE_LIBSSL 1
 
 /*
  * Do we have the OpenSLP library?
@@ -239,7 +263,8 @@
  * Do we have getifaddrs()?
  */
 
-#define HAVE_GETIFADDRS 1
+#undef HAVE_GETIFADDRS
+//#define HAVE_GETIFADDRS 1
 
 
 /*
@@ -276,6 +301,28 @@
 #define HAVE_PYTHON 1
 #define CUPS_PYTHON "/usr/bin/python"
 
+
+/*
+ * Which random number generator function to use...
+ */
+
+#undef HAVE_ARC4RANDOM
+#undef HAVE_RANDOM
+#undef HAVE_LRAND48
+
+#ifdef HAVE_ARC4RANDOM
+#  define CUPS_RAND() arc4random()
+#  define CUPS_SRAND(v)
+#elif defined(HAVE_RANDOM)
+#  define CUPS_RAND() random()
+#  define CUPS_SRAND(v) srandom(v)
+#elif defined(HAVE_LRAND48)
+#  define CUPS_RAND() lrand48()
+#  define CUPS_SRAND(v) srand48(v)
+#else
+#  define CUPS_RAND() rand()
+#  define CUPS_SRAND(v) srand(v)
+#endif /* HAVE_ARC4RANDOM */
 
 #endif /* !_CUPS_CONFIG_H_ */
 

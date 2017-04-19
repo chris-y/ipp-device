@@ -1,55 +1,23 @@
 /*
- * "$Id: util.c,v 1.118 2004/05/13 15:13:42 mike Exp $"
+ * Printing utilities for CUPS.
  *
- *   Printing utilities for the Common UNIX Printing System (CUPS).
+ * Copyright 2007-2015 by Apple Inc.
+ * Copyright 1997-2006 by Easy Software Products.
  *
- *   Copyright 1997-2004 by Easy Software Products.
+ * These coded instructions, statements, and computer programs are the
+ * property of Apple Inc. and are protected by Federal copyright
+ * law.  Distribution and use rights are outlined in the file "LICENSE.txt"
+ * which should have been included with this file.  If this file is
+ * missing or damaged, see the license at "http://www.cups.org/".
  *
- *   These coded instructions, statements, and computer programs are the
- *   property of Easy Software Products and are protected by Federal
- *   copyright law.  Distribution and use rights are outlined in the file
- *   "LICENSE.txt" which should have been included with this file.  If this
- *   file is missing or damaged please contact Easy Software Products
- *   at:
- *
- *       Attn: CUPS Licensing Information
- *       Easy Software Products
- *       44141 Airport View Drive, Suite 204
- *       Hollywood, Maryland 20636-3111 USA
- *
- *       Voice: (301) 373-9603
- *       EMail: cups-info@cups.org
- *         WWW: http://www.cups.org
- *
- *   This file is subject to the Apple OS-Developed Software exception.
- *
- * Contents:
- *
- *   cupsCancelJob()     - Cancel a print job.
- *   cupsDoFileRequest() - Do an IPP request...
- *   cupsFreeJobs()      - Free memory used by job data.
- *   cupsGetClasses()    - Get a list of printer classes.
- *   cupsGetDefault()    - Get the default printer or class.
- *   cupsGetJobs()       - Get the jobs from the server.
- *   cupsGetPPD()        - Get the PPD file for a printer.
- *   cupsGetPrinters()   - Get a list of printers.
- *   cupsLastError()     - Return the last IPP error that occurred.
- *   cupsPrintFile()     - Print a file to a printer or class.
- *   cupsPrintFiles()    - Print one or more files to a printer or class.
- *   cups_connect()      - Connect to the specified host...
+ * This file is subject to the Apple OS-Developed Software exception.
  */
 
 /*
  * Include necessary headers...
  */
 
-#include "cups.h"
-#include "language.h"
-#include "string.h"
-#include "debug.h"
-#include <stdlib.h>
-#include <ctype.h>
-#include <errno.h>
+#include "cups-private.h"
 #include <fcntl.h>
 #include <sys/stat.h>
 #if defined(WIN32) || defined(__EMX__)
@@ -60,408 +28,219 @@
 
 
 /*
- * Local globals...
- */
-
-static http_t		*cups_server = NULL;	/* Current server connection */
-static ipp_status_t	last_error = IPP_OK;	/* Last IPP error */
-
-
-/*
- * Local functions...
- */
-
-static char	*cups_connect(const char *name, char *printer, char *hostname);
-
-
-/*
- * 'cupsCancelJob()' - Cancel a print job.
+ * 'cupsCancelJob()' - Cancel a print job on the default server.
+ *
+ * Pass @code CUPS_JOBID_ALL@ to cancel all jobs or @code CUPS_JOBID_CURRENT@
+ * to cancel the current job on the named destination.
+ *
+ * Use the @link cupsLastError@ and @link cupsLastErrorString@ functions to get
+ * the cause of any failure.
  */
 
 int					/* O - 1 on success, 0 on failure */
 cupsCancelJob(const char *name,		/* I - Name of printer or class */
-              int        job)		/* I - Job ID */
+              int        job_id)	/* I - Job ID, @code CUPS_JOBID_CURRENT@ for the current job, or @code CUPS_JOBID_ALL@ for all jobs */
 {
-  char		printer[HTTP_MAX_URI],	/* Printer name */
-		hostname[HTTP_MAX_URI],	/* Hostname */
-		uri[HTTP_MAX_URI];	/* Printer URI */
-  ipp_t		*request,		/* IPP request */
-		*response;		/* IPP response */
-  cups_lang_t	*language;		/* Language info */
+  return (cupsCancelJob2(CUPS_HTTP_DEFAULT, name, job_id, 0)
+              < IPP_STATUS_REDIRECTION_OTHER_SITE);
+}
+
+
+/*
+ * 'cupsCancelJob2()' - Cancel or purge a print job.
+ *
+ * Canceled jobs remain in the job history while purged jobs are removed
+ * from the job history.
+ *
+ * Pass @code CUPS_JOBID_ALL@ to cancel all jobs or @code CUPS_JOBID_CURRENT@
+ * to cancel the current job on the named destination.
+ *
+ * Use the @link cupsLastError@ and @link cupsLastErrorString@ functions to get
+ * the cause of any failure.
+ *
+ * @since CUPS 1.4/macOS 10.6@
+ */
+
+ipp_status_t				/* O - IPP status */
+cupsCancelJob2(http_t     *http,	/* I - Connection to server or @code CUPS_HTTP_DEFAULT@ */
+               const char *name,	/* I - Name of printer or class */
+               int        job_id,	/* I - Job ID, @code CUPS_JOBID_CURRENT@ for the current job, or @code CUPS_JOBID_ALL@ for all jobs */
+	       int        purge)	/* I - 1 to purge, 0 to cancel */
+{
+  char		uri[HTTP_MAX_URI];	/* Job/printer URI */
+  ipp_t		*request;		/* IPP request */
 
 
  /*
-  * See if we can connect to the server...
+  * Range check input...
   */
 
-  if (!cups_connect(name, printer, hostname))
+  if (job_id < -1 || (!name && job_id == 0))
   {
-    DEBUG_puts("Unable to connect to server!");
-    last_error = IPP_SERVICE_UNAVAILABLE;
+    _cupsSetError(IPP_STATUS_ERROR_INTERNAL, strerror(EINVAL), 0);
     return (0);
   }
 
  /*
-  * Build an IPP_CANCEL_JOB request, which requires the following
+  * Connect to the default server as needed...
+  */
+
+  if (!http)
+    if ((http = _cupsConnect()) == NULL)
+      return (IPP_STATUS_ERROR_SERVICE_UNAVAILABLE);
+
+ /*
+  * Build an IPP_CANCEL_JOB or IPP_PURGE_JOBS request, which requires the following
   * attributes:
   *
   *    attributes-charset
   *    attributes-natural-language
-  *    printer-uri
-  *    job-id
-  *    [requesting-user-name]
+  *    job-uri or printer-uri + job-id
+  *    requesting-user-name
+  *    [purge-job] or [purge-jobs]
   */
 
-  request = ippNew();
+  request = ippNewRequest(job_id < 0 ? IPP_OP_PURGE_JOBS : IPP_OP_CANCEL_JOB);
 
-  request->request.op.operation_id = IPP_CANCEL_JOB;
-  request->request.op.request_id   = 1;
+  if (name)
+  {
+    httpAssembleURIf(HTTP_URI_CODING_ALL, uri, sizeof(uri), "ipp", NULL,
+                     "localhost", ippPort(), "/printers/%s", name);
 
-  language = cupsLangDefault();
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "printer-uri", NULL,
+                 uri);
+    ippAddInteger(request, IPP_TAG_OPERATION, IPP_TAG_INTEGER, "job-id",
+                  job_id);
+  }
+  else if (job_id > 0)
+  {
+    snprintf(uri, sizeof(uri), "ipp://localhost/jobs/%d", job_id);
 
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_CHARSET,
-               "attributes-charset", NULL, cupsLangEncoding(language));
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_LANGUAGE,
-               "attributes-natural-language", NULL,
-               language != NULL ? language->language : "C");
-
-  cupsLangFree(language);
-
-  snprintf(uri, sizeof(uri), "ipp://%s:%d/printers/%s", hostname, ippPort(), printer);
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "printer-uri",
-               NULL, uri);
-
-  ippAddInteger(request, IPP_TAG_OPERATION, IPP_TAG_INTEGER, "job-id", job);
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "job-uri", NULL, uri);
+  }
 
   ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "requesting-user-name",
                NULL, cupsUser());
+
+  if (purge && job_id >= 0)
+    ippAddBoolean(request, IPP_TAG_OPERATION, "purge-job", 1);
+  else if (!purge && job_id < 0)
+    ippAddBoolean(request, IPP_TAG_OPERATION, "purge-jobs", 0);
 
  /*
   * Do the request...
   */
 
-  if ((response = cupsDoRequest(cups_server, request, "/jobs/")) != NULL)
-    ippDelete(response);
+  ippDelete(cupsDoRequest(http, request, "/jobs/"));
 
-  return (last_error < IPP_REDIRECTION_OTHER_SITE);
+  return (cupsLastError());
 }
 
 
 /*
- * 'cupsDoFileRequest()' - Do an IPP request...
+ * 'cupsCreateJob()' - Create an empty job for streaming.
+ *
+ * Use this function when you want to stream print data using the
+ * @link cupsStartDocument@, @link cupsWriteRequestData@, and
+ * @link cupsFinishDocument@ functions.  If you have one or more files to
+ * print, use the @link cupsPrintFile2@ or @link cupsPrintFiles2@ function
+ * instead.
+ *
+ * @since CUPS 1.4/macOS 10.6@
  */
 
-ipp_t *					/* O - Response data */
-cupsDoFileRequest(http_t     *http,	/* I - HTTP connection to server */
-                  ipp_t      *request,	/* I - IPP request */
-                  const char *resource,	/* I - HTTP resource for POST */
-		  const char *filename)	/* I - File to send or NULL */
+int					/* O - Job ID or 0 on error */
+cupsCreateJob(
+    http_t        *http,		/* I - Connection to server or @code CUPS_HTTP_DEFAULT@ */
+    const char    *name,		/* I - Destination name */
+    const char    *title,		/* I - Title of job */
+    int           num_options,		/* I - Number of options */
+    cups_option_t *options)		/* I - Options */
 {
-  ipp_t		*response;		/* IPP response data */
-  char		length[255];		/* Content-Length field */
-  http_status_t	status;			/* Status of HTTP request */
-  FILE		*file;			/* File to send */
-  struct stat	fileinfo;		/* File information */
-  int		bytes;			/* Number of bytes read/written */
-  char		buffer[32768];		/* Output buffer */
+  char		printer_uri[1024],	/* Printer URI */
+		resource[1024];		/* Printer resource */
+  ipp_t		*request,		/* Create-Job request */
+		*response;		/* Create-Job response */
+  ipp_attribute_t *attr;		/* job-id attribute */
+  int		job_id = 0;		/* job-id value */
 
 
-  DEBUG_printf(("cupsDoFileRequest(%p, %p, \'%s\', \'%s\')\n",
-                http, request, resource ? resource : "(null)",
-		filename ? filename : "(null)"));
+  DEBUG_printf(("cupsCreateJob(http=%p, name=\"%s\", title=\"%s\", num_options=%d, options=%p)", (void *)http, name, title, num_options, (void *)options));
 
-  if (http == NULL || request == NULL || resource == NULL)
+ /*
+  * Range check input...
+  */
+
+  if (!name)
   {
-    if (request != NULL)
-      ippDelete(request);
-
-    last_error = IPP_INTERNAL_ERROR;
-    return (NULL);
+    _cupsSetError(IPP_STATUS_ERROR_INTERNAL, strerror(EINVAL), 0);
+    return (0);
   }
 
  /*
-  * See if we have a file to send...
+  * Build a Create-Job request...
   */
 
-  if (filename != NULL)
+  if ((request = ippNewRequest(IPP_OP_CREATE_JOB)) == NULL)
   {
-    if (stat(filename, &fileinfo))
-    {
-     /*
-      * Can't get file information!
-      */
-
-      ippDelete(request);
-      last_error = IPP_NOT_FOUND;
-      return (NULL);
-    }
-
-#ifdef WIN32
-    if (fileinfo.st_mode & _S_IFDIR)
-#else
-    if (S_ISDIR(fileinfo.st_mode))
-#endif /* WIN32 */
-    {
-     /*
-      * Can't send a directory...
-      */
-
-      ippDelete(request);
-      last_error = IPP_NOT_POSSIBLE;
-      return (NULL);
-    }
-
-    if ((file = fopen(filename, "rb")) == NULL)
-    {
-     /*
-      * Can't open file!
-      */
-
-      ippDelete(request);
-      last_error = IPP_NOT_FOUND;
-      return (NULL);
-    }
-  }
-  else
-    file = NULL;
-
- /*
-  * Loop until we can send the request without authorization problems.
-  */
-
-  response = NULL;
-  status   = HTTP_ERROR;
-
-  while (response == NULL)
-  {
-    DEBUG_puts("cupsDoFileRequest: setup...");
-
-   /*
-    * Setup the HTTP variables needed...
-    */
-
-    if (filename != NULL)
-      sprintf(length, "%lu", (unsigned long)(ippLength(request) +
-                                             (size_t)fileinfo.st_size));
-    else
-      sprintf(length, "%lu", (unsigned long)ippLength(request));
-
-    httpClearFields(http);
-    httpSetField(http, HTTP_FIELD_CONTENT_LENGTH, length);
-    httpSetField(http, HTTP_FIELD_CONTENT_TYPE, "application/ipp");
-    httpSetField(http, HTTP_FIELD_AUTHORIZATION, http->authstring);
-
-    DEBUG_printf(("cupsDoFileRequest: authstring=\"%s\"\n", http->authstring));
-
-   /*
-    * Try the request...
-    */
-
-    DEBUG_puts("cupsDoFileRequest: post...");
-
-    if (httpPost(http, resource))
-    {
-      if (httpReconnect(http))
-      {
-        status = HTTP_ERROR;
-        break;
-      }
-      else
-        continue;
-    }
-
-   /*
-    * Send the IPP data and wait for the response...
-    */
-
-    DEBUG_puts("cupsDoFileRequest: ipp write...");
-
-    request->state = IPP_IDLE;
-    status         = HTTP_CONTINUE;
-
-    if (ippWrite(http, request) != IPP_ERROR)
-      if (filename != NULL)
-      {
-        DEBUG_puts("cupsDoFileRequest: file write...");
-
-       /*
-        * Send the file...
-        */
-
-        rewind(file);
-
-        while ((bytes = fread(buffer, 1, sizeof(buffer), file)) > 0)
-	{
-	  if (httpCheck(http))
-	  {
-	    if ((status = httpUpdate(http)) != HTTP_CONTINUE)
-	      break;
-          }
-
-  	  if (httpWrite(http, buffer, bytes) < bytes)
-            break;
-        }
-      }
-
-   /*
-    * Get the server's return status...
-    */
-
-    DEBUG_puts("cupsDoFileRequest: update...");
-
-    while (status == HTTP_CONTINUE)
-      status = httpUpdate(http);
-
-    DEBUG_printf(("cupsDoFileRequest: status = %d\n", status));
-
-    if (status == HTTP_UNAUTHORIZED)
-    {
-      DEBUG_puts("cupsDoFileRequest: unauthorized...");
-
-     /*
-      * Flush any error message...
-      */
-
-      httpFlush(http);
-
-     /*
-      * See if we can do authentication...
-      */
-
-      if (cupsDoAuthentication(http, "POST", resource))
-        break;
-
-      httpReconnect(http);
-
-      continue;
-    }
-    else if (status == HTTP_ERROR)
-    {
-#ifdef WIN32
-      if (http->error != WSAENETDOWN && http->error != WSAENETUNREACH)
-#else
-      if (http->error != ENETDOWN && http->error != ENETUNREACH)
-#endif /* WIN32 */
-        continue;
-      else
-        break;
-    }
-#ifdef HAVE_SSL
-    else if (status == HTTP_UPGRADE_REQUIRED)
-    {
-      /* Flush any error message... */
-      httpFlush(http);
-
-      /* Reconnect... */
-      httpReconnect(http);
-
-      /* Upgrade with encryption... */
-      httpEncryption(http, HTTP_ENCRYPT_REQUIRED);
-
-      /* Try again, this time with encryption enabled... */
-      continue;
-    }
-#endif /* HAVE_SSL */
-    else if (status != HTTP_OK)
-    {
-      DEBUG_printf(("cupsDoFileRequest: error %d...\n", status));
-
-     /*
-      * Flush any error message...
-      */
-
-      httpFlush(http);
-      break;
-    }
-    else
-    {
-     /*
-      * Read the response...
-      */
-
-      DEBUG_puts("cupsDoFileRequest: response...");
-
-      response = ippNew();
-
-      if (ippRead(http, response) == IPP_ERROR)
-      {
-       /*
-        * Delete the response...
-	*/
-
-        DEBUG_puts("IPP read error!");
-	ippDelete(response);
-	response = NULL;
-
-        last_error = IPP_SERVICE_UNAVAILABLE;
-	break;
-      }
-    }
+    _cupsSetError(IPP_STATUS_ERROR_INTERNAL, strerror(ENOMEM), 0);
+    return (0);
   }
 
+  httpAssembleURIf(HTTP_URI_CODING_ALL, printer_uri, sizeof(printer_uri), "ipp",
+                   NULL, "localhost", ippPort(), "/printers/%s", name);
+  snprintf(resource, sizeof(resource), "/printers/%s", name);
+
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "printer-uri",
+               NULL, printer_uri);
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "requesting-user-name",
+               NULL, cupsUser());
+  if (title)
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "job-name", NULL,
+                 title);
+  cupsEncodeOptions2(request, num_options, options, IPP_TAG_OPERATION);
+  cupsEncodeOptions2(request, num_options, options, IPP_TAG_JOB);
+  cupsEncodeOptions2(request, num_options, options, IPP_TAG_SUBSCRIPTION);
+
  /*
-  * Close the file if needed...
+  * Send the request and get the job-id...
   */
 
-  if (filename != NULL)
-    fclose(file);
+  response = cupsDoRequest(http, request, resource);
+
+  if ((attr = ippFindAttribute(response, "job-id", IPP_TAG_INTEGER)) != NULL)
+    job_id = attr->values[0].integer;
+
+  ippDelete(response);
 
  /*
-  * Flush any remaining data...
+  * Return it...
   */
 
-  httpFlush(http);
+  return (job_id);
+}
 
- /*
-  * Delete the original request and return the response...
-  */
-  
-  ippDelete(request);
 
-  if (response)
-    last_error = response->request.status.status_code;
-  else if (status != HTTP_OK)
-  {
-    switch (status)
-    {
-      case HTTP_NOT_FOUND :
-          last_error = IPP_NOT_FOUND;
-	  break;
+/*
+ * 'cupsFinishDocument()' - Finish sending a document.
+ *
+ * The document must have been started using @link cupsStartDocument@.
+ *
+ * @since CUPS 1.4/macOS 10.6@
+ */
 
-      case HTTP_UNAUTHORIZED :
-          last_error = IPP_NOT_AUTHORIZED;
-	  break;
+ipp_status_t				/* O - Status of document submission */
+cupsFinishDocument(http_t     *http,	/* I - Connection to server or @code CUPS_HTTP_DEFAULT@ */
+                   const char *name)	/* I - Destination name */
+{
+  char	resource[1024];			/* Printer resource */
 
-      case HTTP_FORBIDDEN :
-          last_error = IPP_FORBIDDEN;
-	  break;
 
-      case HTTP_BAD_REQUEST :
-          last_error = IPP_BAD_REQUEST;
-	  break;
+  snprintf(resource, sizeof(resource), "/printers/%s", name);
 
-      case HTTP_REQUEST_TOO_LARGE :
-          last_error = IPP_REQUEST_VALUE;
-	  break;
+  ippDelete(cupsGetResponse(http, resource));
 
-      case HTTP_NOT_IMPLEMENTED :
-          last_error = IPP_OPERATION_NOT_SUPPORTED;
-	  break;
-
-      case HTTP_NOT_SUPPORTED :
-          last_error = IPP_VERSION_NOT_SUPPORTED;
-	  break;
-
-      default :
-	  DEBUG_printf(("HTTP error %d mapped to IPP_SERVICE_UNAVAILABLE!\n",
-                	status));
-	  last_error = IPP_SERVICE_UNAVAILABLE;
-	  break;
-    }
-  }
-
-  return (response);
+  return (cupsLastError());
 }
 
 
@@ -473,18 +252,19 @@ void
 cupsFreeJobs(int        num_jobs,	/* I - Number of jobs */
              cups_job_t *jobs)		/* I - Jobs */
 {
-  int	i;				/* Looping var */
+  int		i;			/* Looping var */
+  cups_job_t	*job;			/* Current job */
 
 
-  if (num_jobs <= 0 || jobs == NULL)
+  if (num_jobs <= 0 || !jobs)
     return;
 
-  for (i = 0; i < num_jobs; i ++)
+  for (i = num_jobs, job = jobs; i > 0; i --, job ++)
   {
-    free(jobs[i].dest);
-    free(jobs[i].user);
-    free(jobs[i].format);
-    free(jobs[i].title);
+    _cupsStrFree(job->dest);
+    _cupsStrFree(job->user);
+    _cupsStrFree(job->format);
+    _cupsStrFree(job->title);
   }
 
   free(jobs);
@@ -492,153 +272,82 @@ cupsFreeJobs(int        num_jobs,	/* I - Number of jobs */
 
 
 /*
- * 'cupsGetClasses()' - Get a list of printer classes.
+ * 'cupsGetClasses()' - Get a list of printer classes from the default server.
+ *
+ * This function is deprecated and no longer returns a list of printer
+ * classes - use @link cupsGetDests@ instead.
+ *
+ * @deprecated@
  */
 
 int					/* O - Number of classes */
 cupsGetClasses(char ***classes)		/* O - Classes */
 {
-  int		n;			/* Number of classes */
-  ipp_t		*request,		/* IPP Request */
-		*response;		/* IPP Response */
-  ipp_attribute_t *attr;		/* Current attribute */
-  cups_lang_t	*language;		/* Default language */
-  char		**temp;			/* Temporary pointer */
+  if (classes)
+    *classes = NULL;
 
-
-  if (classes == NULL)
-  {
-    last_error = IPP_INTERNAL_ERROR;
-    return (0);
-  }
-
- /*
-  * Try to connect to the server...
-  */
-
-  if (!cups_connect("default", NULL, NULL))
-  {
-    DEBUG_puts("Unable to connect to server!");
-    last_error = IPP_SERVICE_UNAVAILABLE;
-    return (0);
-  }
-
- /*
-  * Build a CUPS_GET_CLASSES request, which requires the following
-  * attributes:
-  *
-  *    attributes-charset
-  *    attributes-natural-language
-  *    requested-attributes
-  */
-
-  request = ippNew();
-
-  request->request.op.operation_id = CUPS_GET_CLASSES;
-  request->request.op.request_id   = 1;
-
-  language = cupsLangDefault();
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_CHARSET,
-               "attributes-charset", NULL, cupsLangEncoding(language));
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_LANGUAGE,
-               "attributes-natural-language", NULL, language->language);
-
-  cupsLangFree(language);
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD,
-               "requested-attributes", NULL, "printer-name");
-
- /*
-  * Do the request and get back a response...
-  */
-
-  n        = 0;
-  *classes = NULL;
-
-  if ((response = cupsDoRequest(cups_server, request, "/")) != NULL)
-  {
-    last_error = response->request.status.status_code;
-
-    for (attr = response->attrs; attr != NULL; attr = attr->next)
-      if (attr->name != NULL &&
-          strcasecmp(attr->name, "printer-name") == 0 &&
-          attr->value_tag == IPP_TAG_NAME)
-      {
-        if (n == 0)
-	  temp = malloc(sizeof(char *));
-	else
-	  temp = realloc(*classes, sizeof(char *) * (n + 1));
-
-	if (temp == NULL)
-	{
-	 /*
-	  * Ran out of memory!
-	  */
-
-          while (n > 0)
-	  {
-	    n --;
-	    free((*classes)[n]);
-	  }
-
-	  free(*classes);
-	  ippDelete(response);
-	  return (0);
-	}
-
-        *classes = temp;
-        temp[n]  = strdup(attr->values[0].string.text);
-	n ++;
-      }
-
-    ippDelete(response);
-  }
-  else
-    last_error = IPP_BAD_REQUEST;
-
-  return (n);
+  return (0);
 }
 
 
 /*
- * 'cupsGetDefault()' - Get the default printer or class.
+ * 'cupsGetDefault()' - Get the default printer or class for the default server.
+ *
+ * This function returns the default printer or class as defined by
+ * the LPDEST or PRINTER environment variables. If these environment
+ * variables are not set, the server default destination is returned.
+ * Applications should use the @link cupsGetDests@ and @link cupsGetDest@
+ * functions to get the user-defined default printer, as this function does
+ * not support the lpoptions-defined default printer.
  */
 
-const char *				/* O - Default printer or NULL */
+const char *				/* O - Default printer or @code NULL@ */
 cupsGetDefault(void)
+{
+ /*
+  * Return the default printer...
+  */
+
+  return (cupsGetDefault2(CUPS_HTTP_DEFAULT));
+}
+
+
+/*
+ * 'cupsGetDefault2()' - Get the default printer or class for the specified server.
+ *
+ * This function returns the default printer or class as defined by
+ * the LPDEST or PRINTER environment variables. If these environment
+ * variables are not set, the server default destination is returned.
+ * Applications should use the @link cupsGetDests@ and @link cupsGetDest@
+ * functions to get the user-defined default printer, as this function does
+ * not support the lpoptions-defined default printer.
+ *
+ * @since CUPS 1.1.21/macOS 10.4@
+ */
+
+const char *				/* O - Default printer or @code NULL@ */
+cupsGetDefault2(http_t *http)		/* I - Connection to server or @code CUPS_HTTP_DEFAULT@ */
 {
   ipp_t		*request,		/* IPP Request */
 		*response;		/* IPP Response */
   ipp_attribute_t *attr;		/* Current attribute */
-  cups_lang_t	*language;		/* Default language */
-  const char	*var;			/* Environment variable */
-  static char	def_printer[256];	/* Default printer */
+  _cups_globals_t *cg = _cupsGlobals();	/* Pointer to library globals */
 
 
  /*
-  * First see if the LPDEST or PRINTER environment variables are
-  * set...  However, if PRINTER is set to "lp", ignore it to work
-  * around a "feature" in most Linux distributions - the default
-  * user login scripts set PRINTER to "lp"...
+  * See if we have a user default printer set...
   */
 
-  if ((var = getenv("LPDEST")) != NULL)
-    return (var);
-  else if ((var = getenv("PRINTER")) != NULL && strcmp(var, "lp") != 0)
-    return (var);
+  if (_cupsUserDefault(cg->def_printer, sizeof(cg->def_printer)))
+    return (cg->def_printer);
 
  /*
-  * Try to connect to the server...
+  * Connect to the server as needed...
   */
 
-  if (!cups_connect("default", NULL, NULL))
-  {
-    DEBUG_puts("Unable to connect to server!");
-    last_error = IPP_SERVICE_UNAVAILABLE;
-    return (NULL);
-  }
+  if (!http)
+    if ((http = _cupsConnect()) == NULL)
+      return (NULL);
 
  /*
   * Build a CUPS_GET_DEFAULT request, which requires the following
@@ -648,60 +357,76 @@ cupsGetDefault(void)
   *    attributes-natural-language
   */
 
-  request = ippNew();
-
-  request->request.op.operation_id = CUPS_GET_DEFAULT;
-  request->request.op.request_id   = 1;
-
-  language = cupsLangDefault();
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_CHARSET,
-               "attributes-charset", NULL, cupsLangEncoding(language));
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_LANGUAGE,
-               "attributes-natural-language", NULL, language->language);
-
-  cupsLangFree(language);
+  request = ippNewRequest(IPP_OP_CUPS_GET_DEFAULT);
 
  /*
   * Do the request and get back a response...
   */
 
-  if ((response = cupsDoRequest(cups_server, request, "/")) != NULL)
+  if ((response = cupsDoRequest(http, request, "/")) != NULL)
   {
-    last_error = response->request.status.status_code;
-
-    if ((attr = ippFindAttribute(response, "printer-name", IPP_TAG_NAME)) != NULL)
+    if ((attr = ippFindAttribute(response, "printer-name",
+                                 IPP_TAG_NAME)) != NULL)
     {
-      strlcpy(def_printer, attr->values[0].string.text, sizeof(def_printer));
+      strlcpy(cg->def_printer, attr->values[0].string.text,
+              sizeof(cg->def_printer));
       ippDelete(response);
-      return (def_printer);
+      return (cg->def_printer);
     }
 
     ippDelete(response);
   }
-  else
-    last_error = IPP_BAD_REQUEST;
 
   return (NULL);
 }
 
 
 /*
- * 'cupsGetJobs()' - Get the jobs from the server.
+ * 'cupsGetJobs()' - Get the jobs from the default server.
+ *
+ * A "whichjobs" value of @code CUPS_WHICHJOBS_ALL@ returns all jobs regardless
+ * of state, while @code CUPS_WHICHJOBS_ACTIVE@ returns jobs that are
+ * pending, processing, or held and @code CUPS_WHICHJOBS_COMPLETED@ returns
+ * jobs that are stopped, canceled, aborted, or completed.
  */
 
 int					/* O - Number of jobs */
 cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
-            const char *mydest,		/* I - Only show jobs for dest? */
-            int        myjobs,		/* I - Only show my jobs? */
-	    int        completed)	/* I - Only show completed jobs? */
+            const char *name,		/* I - @code NULL@ = all destinations, otherwise show jobs for named destination */
+            int        myjobs,		/* I - 0 = all users, 1 = mine */
+	    int        whichjobs)	/* I - @code CUPS_WHICHJOBS_ALL@, @code CUPS_WHICHJOBS_ACTIVE@, or @code CUPS_WHICHJOBS_COMPLETED@ */
+{
+ /*
+  * Return the jobs...
+  */
+
+  return (cupsGetJobs2(CUPS_HTTP_DEFAULT, jobs, name, myjobs, whichjobs));
+}
+
+
+
+/*
+ * 'cupsGetJobs2()' - Get the jobs from the specified server.
+ *
+ * A "whichjobs" value of @code CUPS_WHICHJOBS_ALL@ returns all jobs regardless
+ * of state, while @code CUPS_WHICHJOBS_ACTIVE@ returns jobs that are
+ * pending, processing, or held and @code CUPS_WHICHJOBS_COMPLETED@ returns
+ * jobs that are stopped, canceled, aborted, or completed.
+ *
+ * @since CUPS 1.1.21/macOS 10.4@
+ */
+
+int					/* O - Number of jobs */
+cupsGetJobs2(http_t     *http,		/* I - Connection to server or @code CUPS_HTTP_DEFAULT@ */
+             cups_job_t **jobs,		/* O - Job data */
+             const char *name,		/* I - @code NULL@ = all destinations, otherwise show jobs for named destination */
+             int        myjobs,		/* I - 0 = all users, 1 = mine */
+	     int        whichjobs)	/* I - @code CUPS_WHICHJOBS_ALL@, @code CUPS_WHICHJOBS_ACTIVE@, or @code CUPS_WHICHJOBS_COMPLETED@ */
 {
   int		n;			/* Number of jobs */
   ipp_t		*request,		/* IPP Request */
 		*response;		/* IPP Response */
   ipp_attribute_t *attr;		/* Current attribute */
-  cups_lang_t	*language;		/* Default language */
   cups_job_t	*temp;			/* Temporary pointer */
   int		id,			/* job-id */
 		priority,		/* job-priority */
@@ -715,38 +440,56 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
 		*title,			/* job-name */
 		*user;			/* job-originating-user-name */
   char		uri[HTTP_MAX_URI];	/* URI for jobs */
+  _cups_globals_t *cg = _cupsGlobals();	/* Pointer to library globals */
   static const char * const attrs[] =	/* Requested attributes */
 		{
+		  "document-format",
 		  "job-id",
-		  "job-priority",
 		  "job-k-octets",
+		  "job-name",
+		  "job-originating-user-name",
+		  "job-printer-uri",
+		  "job-priority",
 		  "job-state",
 		  "time-at-completed",
 		  "time-at-creation",
-		  "time-at-processing",
-		  "job-printer-uri",
-		  "document-format",
-		  "job-name",
-		  "job-originating-user-name"
+		  "time-at-processing"
 		};
 
 
-  if (jobs == NULL)
+ /*
+  * Range check input...
+  */
+
+  if (!jobs)
   {
-    last_error = IPP_INTERNAL_ERROR;
+    _cupsSetError(IPP_STATUS_ERROR_INTERNAL, strerror(EINVAL), 0);
+
     return (-1);
   }
 
  /*
-  * Try to connect to the server...
+  * Get the right URI...
   */
 
-  if (!cups_connect("default", NULL, NULL))
+  if (name)
   {
-    DEBUG_puts("Unable to connect to server!");
-    last_error = IPP_SERVICE_UNAVAILABLE;
-    return (-1);
+    if (httpAssembleURIf(HTTP_URI_CODING_ALL, uri, sizeof(uri), "ipp", NULL,
+                         "localhost", 0, "/printers/%s",
+                         name) < HTTP_URI_STATUS_OK)
+    {
+      _cupsSetError(IPP_STATUS_ERROR_INTERNAL,
+                    _("Unable to create printer-uri"), 1);
+
+      return (-1);
+    }
   }
+  else
+    strlcpy(uri, "ipp://localhost/", sizeof(uri));
+
+  if (!http)
+    if ((http = _cupsConnect()) == NULL)
+      return (-1);
 
  /*
   * Build an IPP_GET_JOBS request, which requires the following
@@ -761,25 +504,7 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
   *    requested-attributes
   */
 
-  request = ippNew();
-
-  request->request.op.operation_id = IPP_GET_JOBS;
-  request->request.op.request_id   = 1;
-
-  language = cupsLangDefault();
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_CHARSET,
-               "attributes-charset", NULL, cupsLangEncoding(language));
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_LANGUAGE,
-               "attributes-natural-language", NULL, language->language);
-
-  cupsLangFree(language);
-
-  if (mydest)
-    snprintf(uri, sizeof(uri), "ipp://localhost/printers/%s", mydest);
-  else
-    strcpy(uri, "ipp://localhost/jobs");
+  request = ippNewRequest(IPP_OP_GET_JOBS);
 
   ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
                "printer-uri", NULL, uri);
@@ -790,9 +515,12 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
   if (myjobs)
     ippAddBoolean(request, IPP_TAG_OPERATION, "my-jobs", 1);
 
-  if (completed)
+  if (whichjobs == CUPS_WHICHJOBS_COMPLETED)
     ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD,
                  "which-jobs", NULL, "completed");
+  else if (whichjobs == CUPS_WHICHJOBS_ALL)
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD,
+                 "which-jobs", NULL, "all");
 
   ippAddStrings(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD,
                 "requested-attributes", sizeof(attrs) / sizeof(attrs[0]),
@@ -805,20 +533,18 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
   n     = 0;
   *jobs = NULL;
 
-  if ((response = cupsDoRequest(cups_server, request, "/")) != NULL)
+  if ((response = cupsDoRequest(http, request, "/")) != NULL)
   {
-    last_error = response->request.status.status_code;
-
-    for (attr = response->attrs; attr != NULL; attr = attr->next)
+    for (attr = response->attrs; attr; attr = attr->next)
     {
      /*
       * Skip leading attributes until we hit a job...
       */
 
-      while (attr != NULL && attr->group_tag != IPP_TAG_JOB)
+      while (attr && attr->group_tag != IPP_TAG_JOB)
         attr = attr->next;
 
-      if (attr == NULL)
+      if (!attr)
         break;
 
      /*
@@ -828,7 +554,7 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
       id              = 0;
       size            = 0;
       priority        = 50;
-      state           = IPP_JOB_PENDING;
+      state           = IPP_JSTATE_PENDING;
       user            = "unknown";
       dest            = NULL;
       format          = "application/octet-stream";
@@ -837,42 +563,42 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
       completed_time  = 0;
       processing_time = 0;
 
-      while (attr != NULL && attr->group_tag == IPP_TAG_JOB)
+      while (attr && attr->group_tag == IPP_TAG_JOB)
       {
-        if (strcmp(attr->name, "job-id") == 0 &&
+        if (!strcmp(attr->name, "job-id") &&
 	    attr->value_tag == IPP_TAG_INTEGER)
 	  id = attr->values[0].integer;
-        else if (strcmp(attr->name, "job-state") == 0 &&
+        else if (!strcmp(attr->name, "job-state") &&
 	         attr->value_tag == IPP_TAG_ENUM)
 	  state = (ipp_jstate_t)attr->values[0].integer;
-        else if (strcmp(attr->name, "job-priority") == 0 &&
+        else if (!strcmp(attr->name, "job-priority") &&
 	         attr->value_tag == IPP_TAG_INTEGER)
 	  priority = attr->values[0].integer;
-        else if (strcmp(attr->name, "job-k-octets") == 0 &&
+        else if (!strcmp(attr->name, "job-k-octets") &&
 	         attr->value_tag == IPP_TAG_INTEGER)
 	  size = attr->values[0].integer;
-        else if (strcmp(attr->name, "time-at-completed") == 0 &&
+        else if (!strcmp(attr->name, "time-at-completed") &&
 	         attr->value_tag == IPP_TAG_INTEGER)
 	  completed_time = attr->values[0].integer;
-        else if (strcmp(attr->name, "time-at-creation") == 0 &&
+        else if (!strcmp(attr->name, "time-at-creation") &&
 	         attr->value_tag == IPP_TAG_INTEGER)
 	  creation_time = attr->values[0].integer;
-        else if (strcmp(attr->name, "time-at-processing") == 0 &&
+        else if (!strcmp(attr->name, "time-at-processing") &&
 	         attr->value_tag == IPP_TAG_INTEGER)
 	  processing_time = attr->values[0].integer;
-        else if (strcmp(attr->name, "job-printer-uri") == 0 &&
+        else if (!strcmp(attr->name, "job-printer-uri") &&
 	         attr->value_tag == IPP_TAG_URI)
 	{
 	  if ((dest = strrchr(attr->values[0].string.text, '/')) != NULL)
 	    dest ++;
         }
-        else if (strcmp(attr->name, "job-originating-user-name") == 0 &&
+        else if (!strcmp(attr->name, "job-originating-user-name") &&
 	         attr->value_tag == IPP_TAG_NAME)
 	  user = attr->values[0].string.text;
-        else if (strcmp(attr->name, "document-format") == 0 &&
+        else if (!strcmp(attr->name, "document-format") &&
 	         attr->value_tag == IPP_TAG_MIMETYPE)
 	  format = attr->values[0].string.text;
-        else if (strcmp(attr->name, "job-name") == 0 &&
+        else if (!strcmp(attr->name, "job-name") &&
 	         (attr->value_tag == IPP_TAG_TEXT ||
 		  attr->value_tag == IPP_TAG_NAME))
 	  title = attr->values[0].string.text;
@@ -884,9 +610,9 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
       * See if we have everything needed...
       */
 
-      if (dest == NULL || id == 0)
+      if (!dest || !id)
       {
-        if (attr == NULL)
+        if (!attr)
 	  break;
 	else
           continue;
@@ -899,19 +625,22 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
       if (n == 0)
         temp = malloc(sizeof(cups_job_t));
       else
-	temp = realloc(*jobs, sizeof(cups_job_t) * (n + 1));
+	temp = realloc(*jobs, sizeof(cups_job_t) * (size_t)(n + 1));
 
-      if (temp == NULL)
+      if (!temp)
       {
        /*
         * Ran out of memory!
         */
 
+        _cupsSetError(IPP_STATUS_ERROR_INTERNAL, NULL, 0);
+
 	cupsFreeJobs(n, *jobs);
 	*jobs = NULL;
 
         ippDelete(response);
-	return (0);
+
+	return (-1);
       }
 
       *jobs = temp;
@@ -922,10 +651,10 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
       * Copy the data over...
       */
 
-      temp->dest            = strdup(dest);
-      temp->user            = strdup(user);
-      temp->format          = strdup(format);
-      temp->title           = strdup(title);
+      temp->dest            = _cupsStrAlloc(dest);
+      temp->user            = _cupsStrAlloc(user);
+      temp->format          = _cupsStrAlloc(format);
+      temp->title           = _cupsStrAlloc(title);
       temp->id              = id;
       temp->priority        = priority;
       temp->state           = state;
@@ -934,16 +663,14 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
       temp->creation_time   = creation_time;
       temp->processing_time = processing_time;
 
-      if (attr == NULL)
+      if (!attr)
         break;
     }
 
     ippDelete(response);
   }
-  else
-    last_error = IPP_BAD_REQUEST;
 
-  if (n == 0 && last_error >= IPP_BAD_REQUEST)
+  if (n == 0 && cg->last_error >= IPP_STATUS_ERROR_BAD_REQUEST)
     return (-1);
   else
     return (n);
@@ -951,620 +678,276 @@ cupsGetJobs(cups_job_t **jobs,		/* O - Job data */
 
 
 /*
- * 'cupsGetPPD()' - Get the PPD file for a printer.
- */
-
-const char *				/* O - Filename for PPD file */
-cupsGetPPD(const char *name)		/* I - Printer name */
-{
-  int		i;			/* Looping var */
-  ipp_t		*request,		/* IPP request */
-		*response;		/* IPP response */
-  ipp_attribute_t *attr;		/* Current attribute */
-  cups_lang_t	*language;		/* Local language */
-  int		fd;			/* PPD file */
-  char		uri[HTTP_MAX_URI],	/* Printer URI */
-		printer[HTTP_MAX_URI],	/* Printer name */
-		method[HTTP_MAX_URI],	/* Method/scheme name */
-		username[HTTP_MAX_URI],	/* Username:password */
-		hostname[HTTP_MAX_URI],	/* Hostname */
-		resource[HTTP_MAX_URI];	/* Resource name */
-  int		port;			/* Port number */
-  http_status_t	status;			/* HTTP status from server */
-  static char	filename[HTTP_MAX_URI];	/* Local filename */
-  static const char * const requested_attrs[] =
-		{			/* Requested attributes */
-		  "printer-uri-supported",
-		  "printer-type",
-		  "member-uris"
-		};
-
-
- /*
-  * Range check input...
-  */
-
-  if (name == NULL)
-  {
-    last_error = IPP_INTERNAL_ERROR;
-    return (NULL);
-  }
-
- /*
-  * See if we can connect to the server...
-  */
-
-  if (!cups_connect(name, printer, hostname))
-  {
-    DEBUG_puts("Unable to connect to server!");
-    last_error = IPP_SERVICE_UNAVAILABLE;
-    return (NULL);
-  }
-
- /*
-  * Build an IPP_GET_PRINTER_ATTRIBUTES request, which requires the following
-  * attributes:
-  *
-  *    attributes-charset
-  *    attributes-natural-language
-  *    printer-uri
-  *    requested-attributes
-  */
-
-  request = ippNew();
-
-  request->request.op.operation_id = IPP_GET_PRINTER_ATTRIBUTES;
-  request->request.op.request_id   = 1;
-
-  language = cupsLangDefault();
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_CHARSET,
-               "attributes-charset", NULL, cupsLangEncoding(language));
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_LANGUAGE,
-               "attributes-natural-language", NULL, language->language);
-
-  cupsLangFree(language);
-
-  snprintf(uri, sizeof(uri), "ipp://localhost/printers/%s", printer);
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
-               "printer-uri", NULL, uri);
-
-  ippAddStrings(request, IPP_TAG_OPERATION, IPP_TAG_NAME,
-                "requested-attributes",
-		sizeof(requested_attrs) / sizeof(requested_attrs[0]),
-		NULL, requested_attrs);
-
- /*
-  * Do the request and get back a response...
-  */
-
-  if ((response = cupsDoRequest(cups_server, request, "/")) != NULL)
-  {
-    last_error  = response->request.status.status_code;
-    printer[0]  = '\0';
-    hostname[0] = '\0';
-
-    if ((attr = ippFindAttribute(response, "member-uris", IPP_TAG_URI)) != NULL)
-    {
-     /*
-      * Get the first actual server and printer name in the class...
-      */
-
-      for (i = 0; i < attr->num_values; i ++)
-      {
-	httpSeparate(attr->values[0].string.text, method, username, hostname,
-	             &port, resource);
-	if (strncmp(resource, "/printers/", 10) == 0)
-	{
-	 /*
-	  * Found a printer!
-	  */
-
-	  strlcpy(printer, resource + 10, sizeof(printer));
-	  break;
-	}
-      }
-    }
-    else if ((attr = ippFindAttribute(response, "printer-uri-supported",
-                                      IPP_TAG_URI)) != NULL)
-    {
-     /*
-      * Get the actual server and printer names...
-      */
-
-      httpSeparate(attr->values[0].string.text, method, username, hostname,
-	           &port, resource);
-      strlcpy(printer, strrchr(resource, '/') + 1, sizeof(printer));
-    }
-
-    ippDelete(response);
-
-   /*
-    * Remap local hostname to localhost...
-    */
-
-    gethostname(uri, sizeof(uri));
-
-    if (strcasecmp(uri, hostname) == 0)
-      strcpy(hostname, "localhost");
-  }
-
-  if (!printer[0])
-  {
-    last_error = IPP_NOT_FOUND;
-    return (NULL);
-  }
-
- /*
-  * Reconnect to the correct server as needed...
-  */
-
-  if (strcasecmp(cups_server->hostname, hostname) != 0)
-  {
-    httpClose(cups_server);
-
-    if ((cups_server = httpConnectEncrypt(hostname, ippPort(),
-                                          cupsEncryption())) == NULL)
-    {
-      DEBUG_puts("Unable to connect to server!");
-      last_error = IPP_SERVICE_UNAVAILABLE;
-      return (NULL);
-    }
-  }
-
- /*
-  * Get a temp file...
-  */
-
-  if ((fd = cupsTempFd(filename, sizeof(filename))) < 0)
-  {
-   /*
-    * Can't open file; close the server connection and return NULL...
-    */
-
-    last_error = IPP_INTERNAL_ERROR;
-    httpFlush(cups_server);
-    httpClose(cups_server);
-    cups_server = NULL;
-    return (NULL);
-  }
-
- /*
-  * And send a request to the HTTP server...
-  */
-
-  snprintf(resource, sizeof(resource), "/printers/%s.ppd", printer);
-
-  status = cupsGetFd(cups_server, resource, fd);
-
-  close(fd);
-
- /*
-  * See if we actually got the file or an error...
-  */
-
-  if (status != HTTP_OK)
-  {
-    switch (status)
-    {
-      case HTTP_NOT_FOUND :
-          last_error = IPP_NOT_FOUND;
-	  break;
-      case HTTP_ERROR :
-          DEBUG_puts("Mapping HTTP error to IPP_SERVICE_UNAVAILABLE");
-          last_error = IPP_SERVICE_UNAVAILABLE;
-	  break;
-      case HTTP_UNAUTHORIZED :
-          last_error = IPP_NOT_AUTHORIZED;
-	  break;
-      default :
-          last_error = IPP_INTERNAL_ERROR;
-	  break;
-    }
-
-    unlink(filename);
-    httpFlush(cups_server);
-    httpClose(cups_server);
-    cups_server = NULL;
-    return (NULL);
-  }
-
- /*
-  * Return the PPD file...
-  */
-
-  return (filename);
-}
-
-
-/*
- * 'cupsGetPrinters()' - Get a list of printers.
+ * 'cupsGetPrinters()' - Get a list of printers from the default server.
+ *
+ * This function is deprecated and no longer returns a list of printers - use
+ * @link cupsGetDests@ instead.
+ *
+ * @deprecated@
  */
 
 int					/* O - Number of printers */
 cupsGetPrinters(char ***printers)	/* O - Printers */
 {
-  int		n;			/* Number of printers */
-  ipp_t		*request,		/* IPP Request */
-		*response;		/* IPP Response */
-  ipp_attribute_t *attr;		/* Current attribute */
-  cups_lang_t	*language;		/* Default language */
-  char		**temp;			/* Temporary pointer */
+  if (printers)
+    *printers = NULL;
 
-
-  if (printers == NULL)
-  {
-    last_error = IPP_INTERNAL_ERROR;
-    return (0);
-  }
-
- /*
-  * Try to connect to the server...
-  */
-
-  if (!cups_connect("default", NULL, NULL))
-  {
-    DEBUG_puts("Unable to connect to server!");
-    last_error = IPP_SERVICE_UNAVAILABLE;
-    return (0);
-  }
-
- /*
-  * Build a CUPS_GET_PRINTERS request, which requires the following
-  * attributes:
-  *
-  *    attributes-charset
-  *    attributes-natural-language
-  *    requested-attributes
-  */
-
-  request = ippNew();
-
-  request->request.op.operation_id = CUPS_GET_PRINTERS;
-  request->request.op.request_id   = 1;
-
-  language = cupsLangDefault();
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_CHARSET,
-               "attributes-charset", NULL, cupsLangEncoding(language));
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_LANGUAGE,
-               "attributes-natural-language", NULL, language->language);
-
-  cupsLangFree(language);
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD,
-               "requested-attributes", NULL, "printer-name");
-
- /*
-  * Do the request and get back a response...
-  */
-
-  n         = 0;
-  *printers = NULL;
-
-  if ((response = cupsDoRequest(cups_server, request, "/")) != NULL)
-  {
-    last_error = response->request.status.status_code;
-
-    for (attr = response->attrs; attr != NULL; attr = attr->next)
-      if (attr->name != NULL &&
-          strcasecmp(attr->name, "printer-name") == 0 &&
-          attr->value_tag == IPP_TAG_NAME)
-      {
-        if (n == 0)
-	  temp = malloc(sizeof(char *));
-	else
-	  temp = realloc(*printers, sizeof(char *) * (n + 1));
-
-	if (temp == NULL)
-	{
-	 /*
-	  * Ran out of memory!
-	  */
-
-	  while (n > 0)
-	  {
-	    n --;
-	    free((*printers)[n]);
-	  }
-
-	  free(*printers);
-	  ippDelete(response);
-	  return (0);
-	}
-
-        *printers = temp;
-        temp[n]   = strdup(attr->values[0].string.text);
-	n ++;
-      }
-
-    ippDelete(response);
-  }
-  else
-    last_error = IPP_BAD_REQUEST;
-
-  return (n);
+  return (0);
 }
 
 
 /*
- * 'cupsLastError()' - Return the last IPP error that occurred.
+ * 'cupsPrintFile()' - Print a file to a printer or class on the default server.
  */
 
-ipp_status_t				/* O - IPP error code */
-cupsLastError(void)
-{
-  return (last_error);
-}
-
-
-/*
- * 'cupsPrintFile()' - Print a file to a printer or class.
- */
-
-int					/* O - Job ID */
-cupsPrintFile(const char    *name,	/* I - Printer or class name */
+int					/* O - Job ID or 0 on error */
+cupsPrintFile(const char    *name,	/* I - Destination name */
               const char    *filename,	/* I - File to print */
 	      const char    *title,	/* I - Title of job */
               int           num_options,/* I - Number of options */
 	      cups_option_t *options)	/* I - Options */
 {
-  DEBUG_printf(("cupsPrintFile(\'%s\', \'%s\', %d, %p)\n",
-                name, filename, num_options, options));
+  DEBUG_printf(("cupsPrintFile(name=\"%s\", filename=\"%s\", title=\"%s\", num_options=%d, options=%p)", name, filename, title, num_options, (void *)options));
 
-  return (cupsPrintFiles(name, 1, &filename, title, num_options, options));
+  return (cupsPrintFiles2(CUPS_HTTP_DEFAULT, name, 1, &filename, title,
+                          num_options, options));
 }
 
 
 /*
- * 'cupsPrintFiles()' - Print one or more files to a printer or class.
+ * 'cupsPrintFile2()' - Print a file to a printer or class on the specified
+ *                      server.
+ *
+ * @since CUPS 1.1.21/macOS 10.4@
  */
 
-int					/* O - Job ID */
-cupsPrintFiles(const char    *name,	/* I - Printer or class name */
-               int           num_files,	/* I - Number of files */
-               const char    **files,	/* I - File(s) to print */
-	       const char    *title,	/* I - Title of job */
-               int           num_options,
-					/* I - Number of options */
-	       cups_option_t *options)	/* I - Options */
+int					/* O - Job ID or 0 on error */
+cupsPrintFile2(
+    http_t        *http,		/* I - Connection to server */
+    const char    *name,		/* I - Destination name */
+    const char    *filename,		/* I - File to print */
+    const char    *title,		/* I - Title of job */
+    int           num_options,		/* I - Number of options */
+    cups_option_t *options)		/* I - Options */
+{
+  DEBUG_printf(("cupsPrintFile2(http=%p, name=\"%s\", filename=\"%s\",  title=\"%s\", num_options=%d, options=%p)", (void *)http, name, filename, title, num_options, (void *)options));
+
+  return (cupsPrintFiles2(http, name, 1, &filename, title, num_options,
+                          options));
+}
+
+
+/*
+ * 'cupsPrintFiles()' - Print one or more files to a printer or class on the
+ *                      default server.
+ */
+
+int					/* O - Job ID or 0 on error */
+cupsPrintFiles(
+    const char    *name,		/* I - Destination name */
+    int           num_files,		/* I - Number of files */
+    const char    **files,		/* I - File(s) to print */
+    const char    *title,		/* I - Title of job */
+    int           num_options,		/* I - Number of options */
+    cups_option_t *options)		/* I - Options */
+{
+  DEBUG_printf(("cupsPrintFiles(name=\"%s\", num_files=%d, files=%p, title=\"%s\", num_options=%d, options=%p)", name, num_files, (void *)files, title, num_options, (void *)options));
+
+ /*
+  * Print the file(s)...
+  */
+
+  return (cupsPrintFiles2(CUPS_HTTP_DEFAULT, name, num_files, files, title,
+                          num_options, options));
+}
+
+
+/*
+ * 'cupsPrintFiles2()' - Print one or more files to a printer or class on the
+ *                       specified server.
+ *
+ * @since CUPS 1.1.21/macOS 10.4@
+ */
+
+int					/* O - Job ID or 0 on error */
+cupsPrintFiles2(
+    http_t        *http,		/* I - Connection to server or @code CUPS_HTTP_DEFAULT@ */
+    const char    *name,		/* I - Destination name */
+    int           num_files,		/* I - Number of files */
+    const char    **files,		/* I - File(s) to print */
+    const char    *title,		/* I - Title of job */
+    int           num_options,		/* I - Number of options */
+    cups_option_t *options)		/* I - Options */
 {
   int		i;			/* Looping var */
-  const char	*val;			/* Pointer to option value */
-  ipp_t		*request;		/* IPP request */
-  ipp_t		*response;		/* IPP response */
-  ipp_attribute_t *attr;		/* IPP job-id attribute */
-  char		hostname[HTTP_MAX_URI],	/* Hostname */
-		printer[HTTP_MAX_URI],	/* Printer or class name */
-		uri[HTTP_MAX_URI];	/* Printer URI */
-  cups_lang_t	*language;		/* Language to use */
-  int		jobid;			/* New job ID */
+  int		job_id;			/* New job ID */
+  const char	*docname;		/* Basename of current filename */
+  const char	*format;		/* Document format */
+  cups_file_t	*fp;			/* Current file */
+  char		buffer[8192];		/* Copy buffer */
+  ssize_t	bytes;			/* Bytes in buffer */
+  http_status_t	status;			/* Status of write */
+  _cups_globals_t *cg = _cupsGlobals();	/* Global data */
+  ipp_status_t	cancel_status;		/* Status code to preserve */
+  char		*cancel_message;	/* Error message to preserve */
 
 
-  DEBUG_printf(("cupsPrintFiles(\'%s\', %d, %p, %d, %p)\n",
-                name, num_files, files, num_options, options));
-
-  if (name == NULL || num_files < 1 || files == NULL)
-    return (0);
+  DEBUG_printf(("cupsPrintFiles2(http=%p, name=\"%s\", num_files=%d, files=%p, title=\"%s\", num_options=%d, options=%p)", (void *)http, name, num_files, (void *)files, title, num_options, (void *)options));
 
  /*
-  * Setup a connection and request data...
+  * Range check input...
   */
 
-  if (!cups_connect(name, printer, hostname))
+  if (!name || num_files < 1 || !files)
   {
-    DEBUG_printf(("cupsPrintFile: Unable to open connection - %s.\n",
-                  strerror(errno)));
-    DEBUG_puts("Unable to connect to server!");
-    last_error = IPP_SERVICE_UNAVAILABLE;
+    _cupsSetError(IPP_STATUS_ERROR_INTERNAL, strerror(EINVAL), 0);
+
     return (0);
   }
 
-  language = cupsLangDefault();
-
  /*
-  * Build a standard CUPS URI for the printer and fill the standard IPP
-  * attributes...
+  * Create the print job...
   */
 
-  if ((request = ippNew()) == NULL)
+  if ((job_id = cupsCreateJob(http, name, title, num_options, options)) == 0)
     return (0);
 
-  request->request.op.operation_id = num_files == 1 ? IPP_PRINT_JOB :
-                                                      IPP_CREATE_JOB;
-  request->request.op.request_id   = 1;
-
-  snprintf(uri, sizeof(uri), "ipp://%s:%d/printers/%s", hostname, ippPort(), printer);
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_CHARSET,
-               "attributes-charset", NULL, cupsLangEncoding(language));
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_LANGUAGE,
-               "attributes-natural-language", NULL,
-               language != NULL ? language->language : "C");
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "printer-uri",
-               NULL, uri);
-
-  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "requesting-user-name",
-               NULL, cupsUser());
-
-  if (title)
-    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "job-name", NULL, title);
-
  /*
-  * Then add all options...
+  * Send each of the files...
   */
 
-  cupsEncodeOptions(request, num_options, options);
+  if (cupsGetOption("raw", num_options, options))
+    format = CUPS_FORMAT_RAW;
+  else if ((format = cupsGetOption("document-format", num_options,
+				   options)) == NULL)
+    format = CUPS_FORMAT_AUTO;
 
- /*
-  * Do the request...
-  */
-
-  snprintf(uri, sizeof(uri), "/printers/%s", printer);
-
-  if (num_files == 1)
-    response = cupsDoFileRequest(cups_server, request, uri, *files);
-  else
-    response = cupsDoRequest(cups_server, request, uri);
-
-  if (response == NULL)
-    jobid = 0;
-  else if (response->request.status.status_code > IPP_OK_CONFLICT)
+  for (i = 0; i < num_files; i ++)
   {
-    DEBUG_printf(("IPP response code was 0x%x!\n",
-                  response->request.status.status_code));
-    jobid = 0;
-  }
-  else if ((attr = ippFindAttribute(response, "job-id", IPP_TAG_INTEGER)) == NULL)
-  {
-    DEBUG_puts("No job ID!");
+   /*
+    * Start the next file...
+    */
 
-    last_error = IPP_SERVICE_UNAVAILABLE;
+    if ((docname = strrchr(files[i], '/')) != NULL)
+      docname ++;
+    else
+      docname = files[i];
 
-    jobid = 0;
-  }
-  else
-    jobid = attr->values[0].integer;
-
-  if (response != NULL)
-    ippDelete(response);
-
- /*
-  * Handle multiple file jobs if the create-job operation worked...
-  */
-
-  if (jobid > 0 && num_files > 1)
-    for (i = 0; i < num_files; i ++)
+    if ((fp = cupsFileOpen(files[i], "rb")) == NULL)
     {
      /*
-      * Build a standard CUPS URI for the job and fill the standard IPP
-      * attributes...
+      * Unable to open print file, cancel the job and return...
       */
 
-      if ((request = ippNew()) == NULL)
-	return (0);
-
-      request->request.op.operation_id = IPP_SEND_DOCUMENT;
-      request->request.op.request_id   = 1;
-
-      snprintf(uri, sizeof(uri), "ipp://%s:%d/jobs/%d", hostname, ippPort(),
-               jobid);
-
-      ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_CHARSET,
-        	   "attributes-charset", NULL, cupsLangEncoding(language));
-
-      ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_LANGUAGE,
-        	   "attributes-natural-language", NULL,
-        	   language != NULL ? language->language : "C");
-
-      ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "job-uri",
-        	   NULL, uri);
-
-     /*
-      * Handle raw print files...
-      */
-
-      if (cupsGetOption("raw", num_options, options))
-	ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_MIMETYPE, "document-format",
-        	     NULL, "application/vnd.cups-raw");
-      else if ((val = cupsGetOption("document-format", num_options, options)) != NULL)
-	ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_MIMETYPE, "document-format",
-        	     NULL, val);
-      else
-	ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_MIMETYPE, "document-format",
-        	     NULL, "application/octet-stream");
-
-      ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "requesting-user-name",
-        	   NULL, cupsUser());
-
-     /*
-      * Is this the last document?
-      */
-
-      if (i == (num_files - 1))
-        ippAddBoolean(request, IPP_TAG_OPERATION, "last-document", 1);
-
-     /*
-      * Send the file...
-      */
-
-      snprintf(uri, sizeof(uri), "/printers/%s", printer);
-
-      if ((response = cupsDoFileRequest(cups_server, request, uri,
-                                        files[i])) != NULL)
-	ippDelete(response);
+      _cupsSetError(IPP_STATUS_ERROR_DOCUMENT_ACCESS, NULL, 0);
+      goto cancel_job;
     }
 
-  cupsLangFree(language);
+    status = cupsStartDocument(http, name, job_id, docname, format,
+			       i == (num_files - 1));
 
-  return (jobid);
-}
+    while (status == HTTP_STATUS_CONTINUE &&
+	   (bytes = cupsFileRead(fp, buffer, sizeof(buffer))) > 0)
+      status = cupsWriteRequestData(http, buffer, (size_t)bytes);
 
+    cupsFileClose(fp);
 
-/*
- * 'cups_connect()' - Connect to the specified host...
- */
+    if (status != HTTP_STATUS_CONTINUE || cupsFinishDocument(http, name) != IPP_STATUS_OK)
+    {
+     /*
+      * Unable to queue, cancel the job and return...
+      */
 
-static char *				/* I - Printer name or NULL */
-cups_connect(const char *name,		/* I - Destination (printer[@host]) */
-	     char       *printer,	/* O - Printer name [HTTP_MAX_URI] */
-             char       *hostname)	/* O - Hostname [HTTP_MAX_URI] */
-{
-  char	hostbuf[HTTP_MAX_URI];		/* Name of host */
-
-
-  DEBUG_printf(("cups_connect(\"%s\", %p, %p)\n", name, printer, hostname));
-
-  if (name == NULL)
-  {
-    last_error = IPP_BAD_REQUEST;
-    return (NULL);
+      goto cancel_job;
+    }
   }
+
+  return (job_id);
 
  /*
-  * All jobs are now queued to cupsServer() to avoid hostname
-  * resolution problems and to ensure that the user sees all
-  * locally queued jobs locally.
+  * If we get here, something happened while sending the print job so we need
+  * to cancel the job without setting the last error (since we need to preserve
+  * the current error...
   */
 
-  strlcpy(hostbuf, cupsServer(), sizeof(hostbuf));
+  cancel_job:
 
-  if (hostname != NULL)
-    strlcpy(hostname, hostbuf, HTTP_MAX_URI);
-  else
-    hostname = hostbuf;
+  cancel_status  = cg->last_error;
+  cancel_message = cg->last_status_message ?
+                       _cupsStrRetain(cg->last_status_message) : NULL;
 
-  if (printer != NULL)
-    strlcpy(printer, name, HTTP_MAX_URI);
-  else
-    printer = (char *)name;
+  cupsCancelJob2(http, name, job_id, 0);
 
-  if (cups_server != NULL)
-  {
-    if (strcasecmp(cups_server->hostname, hostname) == 0)
-      return (printer);
+  cg->last_error          = cancel_status;
+  cg->last_status_message = cancel_message;
 
-    httpClose(cups_server);
-  }
-
-  DEBUG_printf(("connecting to %s on port %d...\n", hostname, ippPort()));
-
-  if ((cups_server = httpConnectEncrypt(hostname, ippPort(),
-                                        cupsEncryption())) == NULL)
-  {
-    DEBUG_puts("Unable to connect to server!");
-    last_error = IPP_SERVICE_UNAVAILABLE;
-    return (NULL);
-  }
-  else
-    return (printer);
+  return (0);
 }
 
 
 /*
- * End of "$Id: util.c,v 1.118 2004/05/13 15:13:42 mike Exp $".
+ * 'cupsStartDocument()' - Add a document to a job created with cupsCreateJob().
+ *
+ * Use @link cupsWriteRequestData@ to write data for the document and
+ * @link cupsFinishDocument@ to finish the document and get the submission status.
+ *
+ * The MIME type constants @code CUPS_FORMAT_AUTO@, @code CUPS_FORMAT_PDF@,
+ * @code CUPS_FORMAT_POSTSCRIPT@, @code CUPS_FORMAT_RAW@, and
+ * @code CUPS_FORMAT_TEXT@ are provided for the "format" argument, although
+ * any supported MIME type string can be supplied.
+ *
+ * @since CUPS 1.4/macOS 10.6@
  */
+
+http_status_t				/* O - HTTP status of request */
+cupsStartDocument(
+    http_t     *http,			/* I - Connection to server or @code CUPS_HTTP_DEFAULT@ */
+    const char *name,			/* I - Destination name */
+    int        job_id,			/* I - Job ID from @link cupsCreateJob@ */
+    const char *docname,		/* I - Name of document */
+    const char *format,			/* I - MIME type or @code CUPS_FORMAT_foo@ */
+    int        last_document)		/* I - 1 for last document in job, 0 otherwise */
+{
+  char		resource[1024],		/* Resource for destinatio */
+		printer_uri[1024];	/* Printer URI */
+  ipp_t		*request;		/* Send-Document request */
+  http_status_t	status;			/* HTTP status */
+
+
+ /*
+  * Create a Send-Document request...
+  */
+
+  if ((request = ippNewRequest(IPP_OP_SEND_DOCUMENT)) == NULL)
+  {
+    _cupsSetError(IPP_STATUS_ERROR_INTERNAL, strerror(ENOMEM), 0);
+    return (HTTP_STATUS_ERROR);
+  }
+
+  httpAssembleURIf(HTTP_URI_CODING_ALL, printer_uri, sizeof(printer_uri), "ipp",
+                   NULL, "localhost", ippPort(), "/printers/%s", name);
+  snprintf(resource, sizeof(resource), "/printers/%s", name);
+
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "printer-uri",
+               NULL, printer_uri);
+  ippAddInteger(request, IPP_TAG_OPERATION, IPP_TAG_INTEGER, "job-id", job_id);
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "requesting-user-name",
+               NULL, cupsUser());
+  if (docname)
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "document-name",
+                 NULL, docname);
+  if (format)
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_MIMETYPE,
+                 "document-format", NULL, format);
+  ippAddBoolean(request, IPP_TAG_OPERATION, "last-document", (char)last_document);
+
+ /*
+  * Send and delete the request, then return the status...
+  */
+
+  status = cupsSendRequest(http, request, resource, CUPS_LENGTH_VARIABLE);
+
+  ippDelete(request);
+
+  return (status);
+}

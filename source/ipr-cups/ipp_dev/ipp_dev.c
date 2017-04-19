@@ -1048,7 +1048,7 @@ UnitProcessEntry(VOID)
 
 					ipp_print_file(printer, path, template);
 
-					DeleteFile(path);
+					Delete(path);
 					path[0] = '\0';
 					done = TRUE;
 

@@ -26,12 +26,12 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <cups/string.h>
+#include <cups/string-private.h>
 #include <cups/cups.h>
-#include <cups/debug.h>
+#include <cups/debug-private.h>
 #include <errno.h>
 #include <assert.h>
-#include "cups/ipp.h"
+#include <cups/ipp.h>
 #include <fcntl.h>
 #ifdef WIN32
 #  include <io.h>
@@ -240,12 +240,12 @@ hex_dump(ipp_uchar_t *buffer, 	/* I - Buffer to dump */
 }
 
 
-int 				/* O - Number of bytes written */
+ssize_t 				/* O - Number of bytes written */
 write_cb(void 			 *data, 	/* I - Data */
 				 ipp_uchar_t *buffer, 	/* I - Buffer to write */
-	 int				 bytes) 	/* I - Number of bytes to write */
+	 size_t				 bytes) 	/* I - Number of bytes to write */
 {
-	int count;				/* Number of bytes */
+	size_t count;				/* Number of bytes */
 
 
  /*
@@ -349,6 +349,9 @@ int main(int argc, char **argv)
   int		port;			/* Port number */
 	
 	int rc = 0;
+	 
+	 //DEBUG_set("t:cups.debug","9",NULL);
+	 
 	 
 	const char* filename = "stdin";
 	char destUrl[256];
@@ -825,16 +828,22 @@ int main(int argc, char **argv)
 
 	// *** send message to printer
 	// parse host, port
-	httpSeparate(printerUri, method, username, hostname,
-	             &port, resource);
-
+/*	httpSeparate(printerUri, method, username, hostname,
+	             &port, resource);*/
+  httpSeparateURI(HTTP_URI_CODING_ALL, printerUri, method, 32, username,
+                  HTTP_MAX_URI, hostname, HTTP_MAX_URI, &port, resource,
+		  HTTP_MAX_URI);
 
 //	const char* host = "edel";
 //	const char* resource = "/printers/printer";
 //	int port = 631;
 	http_t	*http;			/* Connection to server */
-	http = httpConnect(hostname, port);
-	if (http == NULL)
+	
+	/*http = httpConnect(hostname, port); */
+	http = httpConnect2(hostname, port, NULL, AF_INET,
+                       HTTP_ENCRYPTION_IF_REQUESTED, 1, 30000, NULL);
+                       
+   	if (http == NULL)
 	{
 		perror(hostname);
 		ippDelete(request);
@@ -1122,16 +1131,20 @@ int ipp_print_file(const char *printerUri, const char *filename, const char *tmp
 
 	// *** send message to printer
 	// parse host, port
-	httpSeparate(printerUri, method, username, hostname,
-	             &port, resource);
-
+/*	httpSeparate(printerUri, method, username, hostname,
+	             &port, resource); */
+  httpSeparateURI(HTTP_URI_CODING_ALL, printerUri, method, 32, username,
+                  HTTP_MAX_URI, hostname, HTTP_MAX_URI, &port, resource,
+		  HTTP_MAX_URI);
 
 //	const char* host = "edel";
 //	const char* resource = "/printers/printer";
 //	int port = 631;
 	http_t	*http;			/* Connection to server */
-	http = httpConnect(hostname, port);
-	if (http == NULL)
+//	http = httpConnect(hostname, port);
+	http = httpConnect2(hostname, port, NULL, AF_INET,
+                       HTTP_ENCRYPTION_IF_REQUESTED, 1, 30000, NULL);
+   	if (http == NULL)
 	{
 		perror(hostname);
 		ippDelete(request);
