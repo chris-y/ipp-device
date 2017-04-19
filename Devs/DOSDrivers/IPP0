@@ -1,0 +1,11 @@
+/* $VER: PRT 52.1 (10.12.2006) */
+
+EHandler  = L:Port-Handler
+Priority  = 5
+StackSize = 2000
+GlobVec   = -1
+Device    = ipp.device
+Unit      = 0
+Flags     = 0
+Control   = "PAR"
+

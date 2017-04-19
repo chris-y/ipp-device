@@ -1,0 +1,21 @@
+# Microsoft Developer Studio Generated Dependency File, included by cups.mak
+
+.\dest.c : \
+	"..\..\..\program files\microsoft visual studio\vc98\include\basetsd.h"\
+	"..\..\..\program files\microsoft visual studio\vc98\include\string.h"\
+	"..\visualc\config.h"\
+	".\cups.h"\
+	".\http.h"\
+	".\ipp.h"\
+	".\language.h"\
+	".\md5.h"\
+	".\ppd.h"\
+	".\string.h"\
+	
+
+.\emit.c : \
+	"..\..\..\program files\microsoft visual studio\vc98\include\string.h"\
+	"..\visualc\config.h"\
+	".\ppd.h"\
+	".\string.h"\
+	

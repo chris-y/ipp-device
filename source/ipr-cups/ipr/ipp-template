@@ -1,0 +1,59 @@
+;******************************************
+; ip? (ipr/ipq/ipc/iprm) template file
+;******************************************
+;
+; operation attributes
+; example of other job template attributes:
+; 
+[operation-attrs]
+; --- all ip? commands ---
+attributes-charset=utf-8
+attributes-natural-language=en-us
+; set this to your default printer
+;printer-uri=http://edel:631/printers/printer
+
+; this is necessary only on Windows9X if USERNAME environment variable is
+; not set.
+;requesting-user-name=zfischer
+
+
+; --- ipr specific ---
+;document-format=text/plain
+; override job name. 
+;job-name=ipr print job
+
+; --- ipq specific ---
+; this is equivalent to ipq -c
+;which-jobs=completed
+; if enabled, show only jobs for requesting-user-name
+;my-jobs=1
+
+; you may specify your favourite attributes to display with ipq .
+; this could be done via template files, e.g. ipq -t ipp-narrowjobs
+;requested-attributes=job-id
+;requested-attributes=job-uri
+;requested-attributes=job-state
+
+
+; --- ipq specific ---
+; job template attributes
+; note: job template attributes don't need to be specified
+[job-template-attrs]
+;job-priority=50
+;copies=1
+;sides=one-sided
+;job-k-octets=12
+
+
+; job template attributes
+; note: job template attributes not allowed for ipc commands
+[job-template-attrs]
+
+; --- all ip? commands ---
+[options]
+; ip? options non-ipp specific: determines behavior of 
+;   ip? commands rather than ipp protocol
+; 
+; Progress information will be displayed during the printing process
+; if 0, this may be overriden by -v command line option
+verbose=0

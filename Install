@@ -1,0 +1,76 @@
+(welcome)
+
+(set #req-printer 1)
+(set #unit 0)
+(set @default-dest "Devs:")
+(makedir "ENVARC:ipp.device")
+
+(copylib
+	(prompt "Copying ipp.device")
+	(help @copylib-help)
+	(source "Devs/ipp.device")
+	(dest "Devs:")
+	(confirm)
+)
+
+(while #req-printer
+	(
+	(if (exists (tackon "ENVARC:ipp.device/" (cat #unit)))
+		(
+			(set #ipp-env (getenv (tackon "ipp.device/" (cat #unit))))
+		)
+		;else
+		(
+			(set #ipp-env "")
+		)
+	)
+
+	(set #printer
+		(askstring
+			(prompt "ipp.device unit " #unit "\n\n"
+				"Enter the address of your printer\n"
+				"This should be in a format similar to:\n"
+				"ipp://printserver:631/printers/Printer-Name")
+			(help @askstring-help)
+			(default #ipp-env)
+		)
+	)
+
+	(textfile
+		(dest (cat "Devs:DOSDrivers/IPP" #unit))
+		(append "EHandler  = L:Port-Handler\n")
+		(append "Priority  = 5\n")
+		(append "StackSize = 2000\n")
+		(append "GlobVec   = -1\n")
+		(append "Device    = ipp.device\n")
+		(append (cat "Unit      = " #unit "\n"))
+		(append "Flags     = 0\n")
+		(append "Control   = \"PAR\"\n")
+	)
+
+	(copyfiles
+		(prompt "Copying IPP" #unit " mountlist")
+		(help @copyfiles-help)
+		(source "Devs/DOSDrivers/IPP0.info")
+		(dest "Devs:DOSDrivers")
+		(newname (cat "IPP" #unit ".info"))
+	)
+
+	(textfile
+		(dest (tackon "ENVARC:ipp.device/" (cat #unit)))
+		(append #printer)
+	)
+
+	(set #req-printer
+		(askbool
+			(prompt "Set up another printer?")
+			(help @askbool-help)
+		)
+	)
+	(set #unit (+ #unit 1))
+))
+
+(message "Installer will now open Printer Prefs.\nYou will need to select ipp.device for every unit you want to use it with.\nAlso set the driver to PostScript if the server is running CUPS.")
+(run "sys:prefs/printer")
+
+(exit)

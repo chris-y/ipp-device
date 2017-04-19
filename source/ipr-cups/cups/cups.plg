@@ -1,0 +1,99 @@
+<html>
+<body>
+<pre>
+<h1>Build Log</h1>
+<h3>
+--------------------Configuration: cups - Win32 Debug--------------------
+</h3>
+<h3>Command Lines</h3>
+Creating temporary file "C:\DOCUME~1\peter\LOCALS~1\Temp\RSP13FB.tmp" with contents
+[
+/nologo /ML /W3 /Gm /GX /Zi /Od /I "../visualc" /I ".." /D "DEBUG" /D "WIN32" /D "_DEBUG" /D "_MBCS" /D "_LIB" /Fp"Debug/cups.pch" /YX /Fo"Debug/" /Fd"Debug/" /FD /GZ /c 
+"C:\projects\cups-1.1.21rc1\cups\auth.c"
+"C:\projects\cups-1.1.21rc1\cups\dest.c"
+"C:\projects\cups-1.1.21rc1\cups\emit.c"
+"C:\projects\cups-1.1.21rc1\cups\encode.c"
+"C:\projects\cups-1.1.21rc1\cups\getputfile.c"
+"C:\projects\cups-1.1.21rc1\cups\http-addr.c"
+"C:\projects\cups-1.1.21rc1\cups\http-support.c"
+"C:\projects\cups-1.1.21rc1\cups\http.c"
+"C:\projects\cups-1.1.21rc1\cups\ipp-support.c"
+"C:\projects\cups-1.1.21rc1\cups\ipp.c"
+"C:\projects\cups-1.1.21rc1\cups\language.c"
+"C:\projects\cups-1.1.21rc1\cups\mark.c"
+"C:\projects\cups-1.1.21rc1\cups\md5.c"
+"C:\projects\cups-1.1.21rc1\cups\md5passwd.c"
+"C:\projects\cups-1.1.21rc1\cups\options.c"
+"C:\projects\cups-1.1.21rc1\cups\page.c"
+"C:\projects\cups-1.1.21rc1\cups\ppd.c"
+"C:\projects\cups-1.1.21rc1\cups\snprintf.c"
+"C:\projects\cups-1.1.21rc1\cups\string.c"
+"C:\projects\cups-1.1.21rc1\cups\tempfile.c"
+"C:\projects\cups-1.1.21rc1\cups\usersys.c"
+"C:\projects\cups-1.1.21rc1\cups\util.c"
+]
+Creating command line "cl.exe @C:\DOCUME~1\peter\LOCALS~1\Temp\RSP13FB.tmp" 
+Creating temporary file "C:\DOCUME~1\peter\LOCALS~1\Temp\RSP13FC.tmp" with contents
+[
+/nologo /out:"cupsd.lib" 
+".\Debug\auth.obj"
+".\Debug\dest.obj"
+".\Debug\emit.obj"
+".\Debug\encode.obj"
+".\Debug\getputfile.obj"
+".\Debug\http-addr.obj"
+".\Debug\http-support.obj"
+".\Debug\http.obj"
+".\Debug\ipp-support.obj"
+".\Debug\ipp.obj"
+".\Debug\language.obj"
+".\Debug\mark.obj"
+".\Debug\md5.obj"
+".\Debug\md5passwd.obj"
+".\Debug\options.obj"
+".\Debug\page.obj"
+".\Debug\ppd.obj"
+".\Debug\snprintf.obj"
+".\Debug\string.obj"
+".\Debug\tempfile.obj"
+".\Debug\usersys.obj"
+".\Debug\util.obj"
+]
+Creating command line "link.exe -lib @C:\DOCUME~1\peter\LOCALS~1\Temp\RSP13FC.tmp"
+<h3>Output Window</h3>
+Compiling...
+sca-plugin> C:\Program Files\Microsoft Visual Studio\VC98\BIN\cl.exe @C:\DOCUME~1\peter\LOCALS~1\Temp\RSP13FB.tmp 
+auth.c
+dest.c
+emit.c
+encode.c
+getputfile.c
+http-addr.c
+http-support.c
+http.c
+C:\projects\cups-1.1.21rc1\cups\http.c(2084) : warning C4018: '==' : signed/unsigned mismatch
+C:\projects\cups-1.1.21rc1\cups\http.c(2012) : warning C4101: 'set_size' : unreferenced local variable
+ipp-support.c
+ipp.c
+language.c
+mark.c
+md5.c
+md5passwd.c
+options.c
+page.c
+ppd.c
+snprintf.c
+string.c
+tempfile.c
+usersys.c
+util.c
+Creating library...
+sca-plugin> C:\Program Files\Microsoft Visual Studio\VC98\BIN\link.exe -lib @C:\DOCUME~1\peter\LOCALS~1\Temp\RSP13FC.tmp 
+
+
+
+<h3>Results</h3>
+cupsd.lib - 0 error(s), 2 warning(s)
+</pre>
+</body>
+</html>

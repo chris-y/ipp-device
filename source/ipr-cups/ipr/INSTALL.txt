@@ -1,0 +1,44 @@
+Build and Installation instructions for ipr.
+
+Building ipr
+-------------
+
+There are two ways to build this: 1) standalone 2) with CUPS
+
+1) In standalone mode, use pre-packaged cups library files directly in the build:
+a) on windows, load ipr.dsw into Visual Studio and build, or:
+cd ipr-cups/ipr & build.bat
+b) on linux:
+cd ipr-cups; make
+note: in this release, you may need to tweek ipr-cups/Makefile and ipr-cups/Madedefs to
+get it work on your system.
+
+
+2) With Cups:
+a) Download CUPS sources
+b) copy ipr-cups/ipr into cups-1.1.21rc1 or appropriate install directory for CUPS, e.g.:
+cp -a ipr-cups/ipr cups-1.1.21rc1 
+c) Follow usual CUPS instructions: ./configure, make
+d) cd ipr; make; ./install.sh
+
+
+Packaging binary distribution:
+------------------------------
+
+On windows, run:
+cd ipr-cups & dist.bat
+
+
+On linux, run:
+cd ipr-cups/ipr; dist.sh
+
+
+dist files will be located in:
+../dist/win32 and ../dist/linux respectively
+
+
+Installing
+----------
+
+See readme.txt in this directory.
+

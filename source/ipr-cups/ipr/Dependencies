@@ -1,0 +1,8 @@
+# DO NOT DELETE
+
+ipr.o: ../cups/string.h ../config.h ../cups/cups.h ../cups/ipp.h
+ipr.o: ../cups/http.h ../cups/md5.h ../cups/ppd.h ../cups/debug.h
+ipr.o: ../cups/ipp.h AttrGroups.h ../cups/ipp.h iprutil.h
+AttrGroups.o: AttrGroups.h ../cups/ipp.h ../cups/debug.h ../cups/string.h
+AttrGroups.o: ../config.h
+iprutil.o: ../cups/ipp.h iprutil.h

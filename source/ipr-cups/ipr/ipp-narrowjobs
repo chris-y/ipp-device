@@ -1,0 +1,12 @@
+;ipp-narrow-jobs
+; attributes for ipq: narrow output, only a few job attributes specified
+; 
+[operation-attrs]
+attributes-charset=utf-8
+attributes-natural-language=en-us
+;printer-uri=http://edel:631/printers/printer
+requested-attributes=job-id
+requested-attributes=job-state
+requested-attributes=job-name
+limit=10
+my-jobs=1

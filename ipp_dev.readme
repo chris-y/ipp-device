@@ -1,0 +1,34 @@
+Short:        Internet Printing Protocol (IPP) driver
+Author:       chris@unsatisfactorysoftware.co.uk (Chris Young)
+Uploader:     chris@unsatisfactorysoftware.co.uk (Chris Young)
+Type:         driver/print
+Version:      1.1
+Architecture: ppc-amigaos >= 4.0.0
+
+Basic device driver implementing the Internet Printing Protocol.
+
+To use:
+Copy ipp.device to Devs:
+Copy IPP0 to Devs:DOSDrivers
+SetEnv SAVE ipp.device/0 ipp://printserver:631/printers/Printer-Name
+If you are using a CUPS server, you must use the PostScript driver.
+Set the port device to ipp.device.
+
+AmigaOS printing should now go to the network printer.  Some programs
+have internal PostScript printer support or PostScript save abillity.
+It is advised to point these at IPP0: rather than going through the
+AmigaOS standard print options.
+
+You can print PostScript documents by copying them to IPP0:
+If you have mode than one network printer create a copy of IPP0,
+and call it IPP1, editing the Unit line in the file.
+
+
+-----BEGIN PGP MESSAGE-----
+Version: 2.6.3in
+
+iQB7AwUAUXLH+rO1+24s2ZO5AQGu6AMrBhJ5HkzTijnBM0W3dtzznlV0iZ1CBLHX
+OZz+UQBDL+Cue2ZJsA4GcGEDQtwR5EyyVTLozAN1ggtwJqxstp9wdNeriEm7xYa6
+WROH/OeedXarOUwcgwOVjDLPanZsuxC/uwv4QOiJ
+=JCZt
+-----END PGP MESSAGE-----
